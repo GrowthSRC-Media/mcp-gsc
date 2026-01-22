@@ -52,6 +52,7 @@ def get_gsc_service():
             return get_gsc_service_oauth()
         except Exception as e:
             # If OAuth fails, try service account
+            print(f"OAuth authentication failed: {str(e)}")
             pass
     
     # Try service account authentication
@@ -81,13 +82,31 @@ def get_gsc_service_oauth():
     
     # Check if token file exists
     if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+        try:
+            creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+        except Exception as e:
+            # If token file is corrupted, delete it
+            if os.path.exists(TOKEN_FILE):
+                os.remove(TOKEN_FILE)
+            creds = None
     
     # If credentials don't exist or are invalid, get new ones
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            try:
+                creds.refresh(Request())
+                # Save the refreshed credentials
+                with open(TOKEN_FILE, 'w') as token:
+                    token.write(creds.to_json())
+            except Exception as e:
+                # If refresh fails, delete the bad token and trigger new OAuth flow
+                if os.path.exists(TOKEN_FILE):
+                    os.remove(TOKEN_FILE)
+                # Fall through to the OAuth flow below
+                creds = None
+        
+        # Start new OAuth flow if we don't have valid credentials
+        if not creds or not creds.valid:
             # Check if client secrets file exists
             if not os.path.exists(OAUTH_CLIENT_SECRETS_FILE):
                 raise FileNotFoundError(
