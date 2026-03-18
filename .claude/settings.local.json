@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(powershell.exe -Command \"New-Item -ItemType Directory -Force -Path \\\\\"$env:APPDATA\\\\Claude\\\\\" | Out-Null; Write-Output \\\\\"$env:APPDATA\\\\Claude\\\\\"\")",
+      "Bash(powershell.exe -Command \"New-Item -ItemType Directory -Force -Path \\(Join-Path $env:APPDATA 'Claude'\\); Write-Output \\(Join-Path $env:APPDATA 'Claude'\\)\")",
+      "Bash(powershell.exe -Command \"echo \\\\$env:APPDATA\")",
+      "Bash(.venv/Scripts/python.exe gsc_server.py)",
+      "Bash(echo \"EXIT=$?\")"
+    ]
+  }
+}

@@ -1,0 +1,171 @@
+# MCP GSC Setup Prompt — paste this into Claude Code CLI
+
+## Context
+
+The user has already opened a terminal inside the MCP project folder and is running Claude Code from there. Use the current working directory as the project root. Derive all paths dynamically — never hard-code them.
+
+Your job is to walk the user through setting up the Google Search Console MCP server step by step, giving them exact commands to paste and waiting for confirmation at each manual step.
+
+---
+
+## How to give commands to the user
+
+- Do NOT try to open new terminal windows programmatically.
+- When the user needs to run something in a terminal, print the exact command inside a code block and tell them to paste it.
+- Wait for the user to confirm before moving to the next step.
+
+---
+
+## STEP 1 — Confirm project files
+
+Check that the following exist in cwd:
+- Python entrypoint (e.g. `gsc_server.py`)
+- `requirements.txt`
+- Read the server source to find the OAuth callback port/path
+
+Tell the user what you found.
+
+---
+
+## STEP 2 — Virtual environment and dependencies
+
+If `.venv` does not exist, tell the user to paste this in their terminal:
+```
+python -m venv .venv
+```
+
+Then tell them to install dependencies:
+```
+.venv\Scripts\pip install -r requirements.txt
+```
+
+Wait for them to confirm it completed before continuing.
+
+---
+
+## STEP 3 — Google Cloud Console: full setup A to Z
+
+Print this block verbatim and wait for the user to reply "done":
+
+   ─────────────────────────────────────────────────────
+   MANUAL STEP — Google Cloud Console setup (do all of this now)
+
+   ── Part A: Create or select a project ──────────────
+   1. Go to https://console.cloud.google.com/
+   2. At the top, click the project dropdown → "New Project"
+      (or select an existing project you want to use)
+   3. Give it a name (e.g. "GSC MCP") and click Create
+   4. Make sure the new project is selected in the top dropdown
+
+   ── Part B: Enable the Search Console API ───────────
+   5. In the left menu go to: APIs & Services → Library
+   6. Search for "Google Search Console API"
+   7. Click it → click "Enable"
+      (if it already says "Manage", it's already enabled — skip)
+
+   ── Part C: Configure the OAuth consent screen ──────
+   8. Go to: APIs & Services → OAuth consent screen
+   9. User type: select "External" → click Create
+   10. Fill in:
+       - App name: anything (e.g. "GSC MCP")
+       - User support email: your email
+       - Developer contact email: your email
+   11. Click "Save and Continue"
+   12. On the Scopes screen, click "Add or Remove Scopes"
+       Search for and add:
+       https://www.googleapis.com/auth/webmasters.readonly
+       Click Update → Save and Continue
+   13. On the Test Users screen, click "+ Add Users"
+       Add the Google account email that has access to your GSC properties
+       Click Save and Continue
+   14. Review summary → click "Back to Dashboard"
+
+   ── Part D: Create the OAuth 2.0 client ─────────────
+   15. Go to: APIs & Services → Credentials
+   16. Click "+ CREATE CREDENTIALS" → "OAuth 2.0 Client ID"
+   17. Application type: Desktop app
+   18. Name: anything (e.g. "GSC MCP Desktop") → click CREATE
+   19. In the dialog that appears, click "DOWNLOAD JSON"
+   20. Rename the downloaded file to: client_secrets.json
+   21. Move it into this project folder (replace any existing file)
+
+   Reply "done" when finished.
+   ─────────────────────────────────────────────────────
+
+---
+
+## STEP 4 — Verify client_secrets.json
+
+Read the file and confirm it contains a valid `client_id`. If anything looks wrong, tell the user clearly.
+
+---
+
+## STEP 5 — Write the Claude Desktop config
+
+1. Read `%APPDATA%\Claude\claude_desktop_config.json` (expand `%APPDATA%` to its real path).
+   If the file does not exist, start with: `{ "mcpServers": {} }`
+
+2. Merge this entry into `mcpServers` without removing other entries:
+   ```json
+   "gsc": {
+     "command": "<absolute path to .venv\\Scripts\\python.exe>",
+     "args": ["<absolute path to gsc_server.py>"]
+   }
+   ```
+   Build paths from cwd. Use double backslashes in JSON strings.
+
+3. Write the merged JSON back to the config file.
+
+4. Print the complete final contents of the file so the user can verify it.
+
+---
+
+## STEP 6 — Pre-launch browser instruction
+
+Print this block verbatim before telling the user to restart Claude Desktop:
+
+   ─────────────────────────────────────────────────────
+   BEFORE you restart Claude Desktop:
+
+   Open your browser and make sure you are signed into the Google account
+   that has access to your Google Search Console properties.
+
+   If you have multiple Google accounts in the browser, switch to the
+   correct one NOW — whichever account is active in the browser when
+   Claude Desktop first starts the server is the one that gets authorized.
+
+   If the wrong account gets authorized later, use the "reauthenticate"
+   tool inside Claude Desktop to redo the OAuth flow.
+   ─────────────────────────────────────────────────────
+
+---
+
+## STEP 7 — Restart Claude Desktop
+
+Tell the user to:
+1. Fully quit Claude Desktop (system tray → Quit, or Task Manager → End Task)
+2. Reopen Claude Desktop
+3. A browser tab will open asking to authorize Google Search Console — approve it with the correct account
+4. In Claude Desktop, type: `list_sites` to confirm the server is working
+
+---
+
+## Important rules
+
+- Derive all paths from cwd — never hard-code them.
+- Do not ask the user to activate `.venv` — always reference `.venv\Scripts\python` and `.venv\Scripts\pip` directly.
+- Do not try to open new terminal windows — print commands for the user to paste instead.
+- Do not run the MCP server manually for testing. It is a stdio server meant to be launched by Claude Desktop, not run directly in a terminal. Running it directly will show JSON parse errors — this is expected and not a bug.
+- Windows only — use backslash paths and PowerShell/CMD syntax. Never use Unix syntax.
+- If any step fails, explain the error clearly and tell the user what to do.
+
+---
+
+## Expected output at end of session
+
+- Confirmation that `.venv` and dependencies are installed
+- Confirmation that `client_secrets.json` is present and valid
+- The exact JSON written to `claude_desktop_config.json`
+- The full path of the config file
+- Reminder to have the correct browser account active before restarting Claude Desktop
+- Reminder to restart Claude Desktop and test with `list_sites`

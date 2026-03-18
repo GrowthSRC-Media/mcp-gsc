@@ -133,8 +133,8 @@ def get_gsc_service_oauth():
             
             # Start OAuth flow
             flow = InstalledAppFlow.from_client_secrets_file(OAUTH_CLIENT_SECRETS_FILE, SCOPES)
-            creds = flow.run_local_server(port=0)
-            
+            creds = flow.run_local_server(port=8080)
+
             # Save the credentials for future use
             with open(TOKEN_FILE, 'w') as token:
                 token.write(creds.to_json())
@@ -1628,7 +1628,7 @@ async def reauthenticate() -> str:
 
         # Trigger new OAuth flow — this opens a browser window on the local machine
         flow = InstalledAppFlow.from_client_secrets_file(OAUTH_CLIENT_SECRETS_FILE, SCOPES)
-        creds = flow.run_local_server(port=0)
+        creds = flow.run_local_server(port=8080)
 
         # Save the new credentials for future use
         with open(TOKEN_FILE, "w") as token:
