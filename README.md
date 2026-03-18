@@ -56,55 +56,78 @@ Here's what you can ask your AI assistant to do once you've set up this integrat
 
 ---
 
-## Getting Started (No Coding Experience Required!)
+## Getting Started
 
-### 1. Set Up Google Search Console API Access
+### Quick setup with Claude Code CLI (recommended for Windows)
 
-Before using this tool, you'll need to create API credentials that allow your AI assistant to access your GSC data:
+If you have [Claude Code CLI](https://github.com/anthropics/claude-code) installed, you can automate the entire setup:
 
-#### Authentication Options
+1. Open a terminal **inside the project folder**
+2. Run `claude` to start Claude Code
+3. Paste the contents of `codex_mcp_setup_prompt.txt` — Claude will walk you through every step interactively
 
-The tool supports two authentication methods:
+---
 
-##### 1. OAuth Authentication (Recommended)
+### Manual setup
 
-This method allows you to authenticate with your own Google account, which is often more convenient than using a service account. It will have access to the same resources you normally do.
+### 1. Install Required Software
 
-Set `GSC_SKIP_OAUTH` to "true", "1", or "yes" to skip OAuth authentication and use only service account authentication
+You'll need:
 
-###### Setup Instructions:
+- [Python](https://www.python.org/downloads/) (version 3.11 or newer)
+- An MCP-compatible AI client — [Claude Desktop](https://claude.ai/download), [Cursor](https://www.cursor.com/), [Codex CLI](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), or [Antigravity](https://antigravity.ai/)
 
-1. Go to the [Google Cloud Console](https://console.cloud.google.com/) and create a Google Cloud account if you don't have one
-2. Create a new project or select an existing one
-3. [Enable the Search Console API](https://console.cloud.google.com/apis/library/searchconsole.googleapis.com) for your project
-4. [Add scope](https://console.cloud.google.com/auth/scopes) `https://www.googleapis.com/auth/webmasters` to your project
-5. Go to the ["Credentials" page](https://console.cloud.google.com/apis/credentials)
-6. Click "Create Credentials" and select "OAuth client ID"
-7. Configure the OAuth consent screen
-8. For application type, select "Desktop app"
-9. Give your OAuth client a name and click "Create"
-10. Download the client secrets JSON file (it will be named something like `client_secrets.json`)
-11. Place this file in the same directory as the script or set the `GSC_OAUTH_CLIENT_SECRETS_FILE` environment variable to point to its location
+### 2. Download the project
 
-When you run the tool for the first time with OAuth authentication, it will open a browser window asking you to sign in to your Google account and authorize the application. After authorization, the tool will save the token for future use.
+Click the green "Code" button → "Download ZIP" and unzip to a folder you can find easily (e.g. Documents), or clone with Git:
 
-##### 2. Service Account Authentication
+```bash
+git clone https://github.com/AminForou/mcp-gsc.git
+```
 
-This method uses a service account, which is useful for automated scripts or when you don't want to use your personal Google account. This requires adding the service account as a user in Google Search Console.
+### 3. Set up Google Cloud Console (A to Z)
 
-###### Setup Instructions:
+You need to create OAuth credentials that allow your AI client to access your GSC data. Follow all parts in order.
 
-1. Go to the [Google Cloud Console](https://console.cloud.google.com/) and create a Google Cloud account if you don't have one
-2. Create a new project or select an existing one
-3. [Enable the Search Console API](https://console.cloud.google.com/apis/library/searchconsole.googleapis.com) for your project
-4. Go to the ["Credentials" page](https://console.cloud.google.com/apis/credentials)
-5. Click "Create Credentials" and select "Service Account"
-6. Fill in the service account details and click "Create"
-7. Click on the newly created service account
-8. Go to the "Keys" tab and click "Add Key" > "Create new key"
-9. Select JSON format and click "Create"
-10. Download the key file and save it as `service_account_credentials.json` in the same directory as the script or set the `GSC_CREDENTIALS_PATH` environment variable to point to its location
-11. Add your service account email address to appropriate Search Console properties
+#### Part A — Create or select a project
+
+1. Go to [console.cloud.google.com](https://console.cloud.google.com/)
+2. At the top click the project dropdown → **New Project** (or select an existing one)
+3. Give it a name (e.g. "GSC MCP") → click **Create**
+4. Make sure the project is selected in the top dropdown
+
+#### Part B — Enable the Search Console API
+
+5. Go to **APIs & Services → Library**
+6. Search for **Google Search Console API**
+7. Click it → click **Enable** (if it already says "Manage" it's already enabled)
+
+#### Part C — Configure the OAuth consent screen
+
+8. Go to **APIs & Services → OAuth consent screen**
+9. User type: **External** → click **Create**
+10. Fill in:
+    - App name: anything (e.g. "GSC MCP")
+    - User support email: your email
+    - Developer contact email: your email
+11. Click **Save and Continue**
+12. On the Scopes screen click **Add or Remove Scopes**, search for and add:
+    `https://www.googleapis.com/auth/webmasters.readonly`
+    → click **Update** → **Save and Continue**
+13. On the Test Users screen click **+ Add Users**, add the Google account email that has access to your GSC properties → **Save and Continue**
+14. Review summary → click **Back to Dashboard**
+
+> **Why test users?** While your app is in "testing" mode (not published), only accounts listed here can complete the OAuth flow. If you skip this step, you'll get an "access blocked" error.
+
+#### Part D — Create the OAuth 2.0 client (Desktop App)
+
+15. Go to **APIs & Services → Credentials**
+16. Click **+ CREATE CREDENTIALS → OAuth 2.0 Client ID**
+17. Application type: **Desktop app**
+18. Name: anything (e.g. "GSC MCP Desktop") → click **Create**
+19. In the dialog click **Download JSON**
+20. Rename the file to `client_secrets.json`
+21. Move it into the project folder (replace any existing file)
 
 **🎬 Watch this beginner-friendly tutorial on Youtube:**
 
@@ -116,141 +139,86 @@ This method uses a service account, which is useful for automated scripts or whe
 
 *Click the image above to watch the step-by-step video tutorial*
 
-### 2. Install Required Software
+#### Alternative: Service Account Authentication
 
-You'll need to install these tools on your computer:
+Use this instead of OAuth if you need automated/headless access.
 
-- [Python](https://www.python.org/downloads/) (version 3.11 or newer) - This runs the MCP server
-- [Node.js](https://nodejs.org/en) - Required for running the MCP inspector and certain MCP components
-- An MCP-compatible AI client — [Claude Desktop](https://claude.ai/download), [Cursor](https://www.cursor.com/), [Codex CLI](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), or [Antigravity](https://antigravity.ai/) are all supported
+1. Go to **APIs & Services → Credentials**
+2. Click **+ CREATE CREDENTIALS → Service Account**, fill in details → **Create**
+3. Click the new service account → **Keys** tab → **Add Key → Create new key → JSON** → download
+4. Save the file as `service_account_credentials.json` in the project folder
+5. Add the service account email as a user in your Google Search Console properties
 
-Make sure both Python and Node.js are properly installed and available in your system path before proceeding.
+### 4. Install dependencies
 
-### 3. Download the Google Search Console MCP 
+Open a terminal in the project folder:
 
-You need to download this tool to your computer. The easiest way is:
-
-1. Click the green "Code" button at the top of this page
-2. Select "Download ZIP"
-3. Unzip the downloaded file to a location you can easily find (like your Documents folder)
-
-Alternatively, if you're familiar with Git:
-
-```bash
-git clone https://github.com/AminForou/mcp-gsc.git
+**Windows (PowerShell):**
+```powershell
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
 ```
 
-### 4. Install Required Components
-
-Open your computer's Terminal (Mac) or Command Prompt (Windows):
-
-1. Navigate to the folder where you unzipped the files:
-   ```bash
-   # Example (replace with your actual path):
-   cd ~/Documents/mcp-gsc-main
-   ```
-
-2. Create a virtual environment (this keeps the project dependencies isolated):
-   ```bash
-   # Using uv (recommended):
-   uv venv .venv
-   
-   # If uv is not installed, install it first:
-   pip install uv
-   # Then create the virtual environment:
-   uv venv .venv
-
-   # OR using standard Python:
-   python -m venv .venv
-   ```
-
-   **Note:** If you get a "pip not found" error when trying to install uv, see the "If you get 'pip not found' error" section below.
-
-3. Activate the virtual environment:
-   ```bash
-   # On Mac/Linux:
-   source .venv/bin/activate
-   
-   # On Windows:
-   .venv\Scripts\activate
-   ```
-
-4. Install the required dependencies:
-   ```bash
-   # Using uv:
-   uv pip install -r requirements.txt
-
-   # OR using standard pip:
-   pip install -r requirements.txt
-   ```
-
-   **If you get "pip not found" error:**
-   ```bash
-   # First ensure pip is installed and updated:
-   python3 -m ensurepip --upgrade
-   python3 -m pip install --upgrade pip
-   
-   # Then try installing the requirements again:
-   python3 -m pip install -r requirements.txt
-   
-   # Or to install uv:
-   python3 -m pip install uv
-   ```
-
-When you see `(.venv)` at the beginning of your command prompt, it means the virtual environment is active and the dependencies will be installed there without affecting your system Python installation.
-
-### 5. Connect Your AI Client to Google Search Console
-
-The configuration below uses Claude Desktop as an example. For other clients (Cursor, Codex, Gemini CLI, Antigravity), the JSON structure is the same — check your client's documentation for where the config file lives.
-
-1. Download and install [Claude Desktop](https://claude.ai/download) if you haven't already
-2. Make sure you have your Google credentials file saved somewhere on your computer
-3. Open your computer's Terminal (Mac) or Command Prompt (Windows) and type:
-
+**Mac/Linux:**
 ```bash
-   # For Mac users:
-   nano ~/Library/Application\ Support/Claude/claude_desktop_config.json
-   
-   # For Windows users:
-   notepad %APPDATA%\Claude\claude_desktop_config.json
-   ```
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
 
-4. Add the following configuration text (this tells your AI client how to connect to GSC):
+### 5. Configure your AI client
 
-#### OAuth authentication (using your own account)
+The MCP server is a **stdio server** — your AI client launches it automatically. Do not run it manually in a terminal.
 
-   ```json
-   {
-     "mcpServers": {
-       "gscServer": {
-         "command": "/FULL/PATH/TO/-main/.venv/bin/python",
-         "args": ["/FULL/PATH/TO/mcp-gsc-main/gsc_server.py"],
-         "env": {
-           "GSC_OAUTH_CLIENT_SECRETS_FILE": "/FULL/PATH/TO/client_secrets.json",
-           "GSC_DATA_STATE": "all"
-         }
-       }
-     }
-   }
-   ```
+Open the Claude Desktop config file:
+
+- **Mac:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
+
+If the file doesn't exist, create it. Add the `gsc` entry to `mcpServers` (merge with any existing entries, don't replace them):
+
+#### OAuth authentication (recommended)
+
+**Windows paths:**
+```json
+{
+  "mcpServers": {
+    "gsc": {
+      "command": "C:\\full\\path\\to\\mcp-gsc\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\full\\path\\to\\mcp-gsc\\gsc_server.py"],
+      "env": {
+        "GSC_DATA_STATE": "all"
+      }
+    }
+  }
+}
+```
+
+**Mac/Linux paths:**
+```json
+{
+  "mcpServers": {
+    "gsc": {
+      "command": "/full/path/to/mcp-gsc/.venv/bin/python",
+      "args": ["/full/path/to/mcp-gsc/gsc_server.py"],
+      "env": {
+        "GSC_DATA_STATE": "all"
+      }
+    }
+  }
+}
+```
 
 #### Service account authentication
 
-   ```json
-   {
-     "mcpServers": {
-       "gscServer": {
-         "command": "/FULL/PATH/TO/-main/.venv/bin/python",
-         "args": ["/FULL/PATH/TO/mcp-gsc-main/gsc_server.py"],
-         "env": {
-           "GSC_CREDENTIALS_PATH": "/FULL/PATH/TO/service_account_credentials.json",
-           "GSC_SKIP_OAUTH": "true",
-           "GSC_DATA_STATE": "all"
-         }
-       }
-     }
-   }
-   ```
+Add `GSC_CREDENTIALS_PATH` and `GSC_SKIP_OAUTH` to the `env` block:
+
+```json
+"env": {
+  "GSC_CREDENTIALS_PATH": "C:\\full\\path\\to\\service_account_credentials.json",
+  "GSC_SKIP_OAUTH": "true",
+  "GSC_DATA_STATE": "all"
+}
+```
 
 #### Environment Variables Reference
 
@@ -261,28 +229,18 @@ The configuration below uses Claude Desktop as an example. For other clients (Cu
 | `GSC_SKIP_OAUTH` | No | `false` | Set to `"true"` to force service account auth and skip OAuth |
 | `GSC_DATA_STATE` | No | `"all"` | `"all"` returns fresh data matching the GSC dashboard. `"final"` returns only confirmed data (2–3 day lag). |
 
-   **Important:** Replace all paths with the actual locations on your computer:
-   
-   - The first path should point to the Python executable inside your virtual environment
-   - The second path should point to the `gsc_server.py` file inside the folder you unzipped
-   - The third path should point to your Google service account credentials JSON file
-   
-   Examples:
-   - Mac: 
-     - Python path: `/Users/yourname/Documents/mcp-gsc/.venv/bin/python`
-     - Script path: `/Users/yourname/Documents/mcp-gsc/gsc_server.py`
-   - Windows: 
-     - Python path: `C:\\Users\\yourname\\Documents\\mcp-gsc\\.venv\\Scripts\\python.exe`
-     - Script path: `C:\\Users\\yourname\\Documents\\mcp-gsc\\gsc_server.py`
+### 6. Restart Claude Desktop and authorize
 
-5. Save the file:
-   - Mac: Press Ctrl+O, then Enter, then Ctrl+X to exit
-   - Windows: Click File > Save, then close Notepad
+> **Important:** Before restarting Claude Desktop, open your browser and make sure you are signed into the Google account that has access to your GSC properties. Whichever account is active in the browser when Claude Desktop first starts is the one that gets authorized.
 
-6. Restart your AI client
-7. When it opens, you should now see GSC tools available in the tools section
+1. Fully quit Claude Desktop (system tray → Quit, or Task Manager → End Task on Windows)
+2. Reopen Claude Desktop
+3. A browser tab will open asking you to authorize Google Search Console — approve it with the correct account
+4. In Claude Desktop, type `list_sites` to confirm everything is working
 
-### 6. Start Analyzing Your SEO Data!
+If the wrong Google account was authorized, use the `reauthenticate` tool inside Claude Desktop to redo the OAuth flow.
+
+### 7. Start Analyzing Your SEO Data!
 
 Now you can ask your AI assistant questions about your GSC data! It can not only retrieve the data but also analyze it, explain trends, and create visualizations to help you understand your SEO performance better.
 
