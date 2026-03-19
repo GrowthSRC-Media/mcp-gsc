@@ -1,8 +1,9 @@
 # MCP GSC Setup Guide
 
 This file is read automatically by Claude Code at the start of every session.
-Your job is to walk the user through setting up the Google Search Console MCP server step by step,
-giving them exact commands to paste and waiting for confirmation at each manual step.
+Your job is to autonomously execute all automatable setup steps (venv, pip install, config file edits) yourself without asking the user to run commands. Only pause for steps that genuinely require the user's browser, Google account, or GUI interaction.
+
+When the user says anything like "run the server", "set up the server", "start the server", or "configure GSC" — begin executing Steps 1–6 immediately and in sequence. Do NOT explain that the server is a stdio server and stop there. Instead, start doing the work: check files, create the venv, install deps, find the config path, write the config. Tell the user what you are doing at each step as you go.
 
 ---
 
@@ -27,22 +28,24 @@ Tell the user what you found.
 
 ## STEP 2 — Virtual environment and dependencies
 
-**2a.** If `.venv` does not exist, tell the user to paste this:
+Run all sub-steps yourself using the Bash tool — do NOT ask the user to run anything here.
+
+**2a.** If `.venv` does not exist, run it yourself:
 ```
 python -m venv .venv
 ```
 
-**2b.** Then install dependencies:
+**2b.** Run the dependency install yourself:
 ```
 .venv\Scripts\pip install -r requirements.txt
 ```
 
-**2c.** After the user says done, verify it yourself by running:
+**2c.** Verify the install yourself by running:
 ```
 .venv\Scripts\python -c "import mcp; import google.auth; import googleapiclient; print('OK')"
 ```
 - If output is `OK` — proceed.
-- If it errors with `ModuleNotFoundError` — tell the user the install did not complete and ask them to re-run the pip command and paste the full output.
+- If it errors with `ModuleNotFoundError` — re-run the pip install command yourself and check again. If it still fails after retrying, show the user the error output and ask them to investigate their Python installation.
 
 ---
 
@@ -122,15 +125,15 @@ Claude Desktop on Windows can be installed two ways, each using a different conf
 
 - **Microsoft Store version:** `C:\Users\<name>\AppData\Local\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json`
 
-To find the correct one, run this PowerShell command and show the output to the user:
+Run this PowerShell command yourself to detect the install type:
 ```powershell
 Get-ChildItem "$env:LOCALAPPDATA\Packages" -Filter "Claude_*" -Directory | Select-Object -ExpandProperty FullName
 ```
 
-- If a `Claude_*` folder is found → the config is inside it at `LocalCache\Roaming\Claude\claude_desktop_config.json`
-- If no folder found → use the standard `%APPDATA%\Claude\claude_desktop_config.json` path
+- If a `Claude_*` folder is found → use `<that folder>\LocalCache\Roaming\Claude\claude_desktop_config.json`
+- If no folder found → use `$env:APPDATA\Claude\claude_desktop_config.json`
 
-Confirm with the user which path applies before writing.
+Determine the path yourself and proceed directly to Step 6 — do NOT ask the user to confirm which path to use.
 
 ---
 
@@ -194,7 +197,8 @@ Tell the user:
 
 - Derive all paths from cwd — never hard-code them.
 - Do not ask the user to activate `.venv` — always reference `.venv\Scripts\python` and `.venv\Scripts\pip` directly.
-- Do not try to open new terminal windows — print commands for the user to paste instead.
+- For terminal commands Claude can run itself (e.g. venv creation, pip install, import checks), always run them directly using the Bash tool — do NOT ask the user to paste them.
+- Only ask the user to run commands manually when it requires their credentials, browser interaction, or GUI actions that Claude cannot automate.
 - Do not run the MCP server manually for testing. It is a stdio server launched by Claude Desktop automatically. Running it directly in a terminal will show JSON parse errors — this is expected and not a bug. "Server not running" in Claude Desktop means dependencies are missing, not that you need to run it manually.
 - Windows only — use PowerShell/Windows syntax. Never use Unix syntax.
 - Always verify results yourself after each step — do not trust "done" without checking.
