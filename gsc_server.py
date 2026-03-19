@@ -2,52 +2,114 @@ from typing import Any, Dict, List, Optional
 import logging
 import os
 import json
+import secrets
+import contextvars
+import re
 from datetime import datetime, timedelta
 
-import google.auth
-from google.auth.transport.requests import Request
+# Load .env before reading any os.environ values
+from dotenv import load_dotenv
+load_dotenv()
+
+import uvicorn
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse, Response
+from starlette.routing import Route, Mount
+from starlette.middleware.base import BaseHTTPMiddleware
+
+from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google_auth_oauthlib.flow import InstalledAppFlow, Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# Suppress the noisy file_cache warning from google-api-python-client.
-# Some MCP hosts (e.g. GitHub Copilot CLI) treat any stderr output as a
-# fatal error, so this prevents false crashes.
-logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
+# Allow OAuth over plain http in local/dev mode (when SERVER_URL is http://)
+if (os.environ.get("SERVER_URL") or "").startswith("http://"):
+    os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
 
-# MCP
+# ─── Logging ───────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("gsc-mcp")
+
+# Suppress noisy third-party loggers
+logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
+logging.getLogger("googleapiclient.discovery").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+from mcp.server.sse import SseServerTransport
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("gsc-server")
 
-# Path to your service account JSON or user credentials JSON
-# First check if GSC_CREDENTIALS_PATH environment variable is set
-# Then try looking in the script directory and current working directory as fallbacks
-GSC_CREDENTIALS_PATH = os.environ.get("GSC_CREDENTIALS_PATH")
+# ─── Config (all values come from .env) ────────────────────────────────────────
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-POSSIBLE_CREDENTIAL_PATHS = [
-    GSC_CREDENTIALS_PATH,  # First try the environment variable if set
-    os.path.join(SCRIPT_DIR, "service_account_credentials.json"),
-    os.path.join(os.getcwd(), "service_account_credentials.json"),
-    # Add any other potential paths here
-]
 
-# OAuth client secrets file path
-OAUTH_CLIENT_SECRETS_FILE = os.environ.get("GSC_OAUTH_CLIENT_SECRETS_FILE")
-if not OAUTH_CLIENT_SECRETS_FILE:
-    OAUTH_CLIENT_SECRETS_FILE = os.path.join(SCRIPT_DIR, "client_secrets.json")
+DATA_DIR = os.environ.get("DATA_DIR") or SCRIPT_DIR
+os.makedirs(DATA_DIR, exist_ok=True)  # ensure data dir exists before any writes
 
-# Token file path for storing OAuth tokens
-TOKEN_FILE = os.path.join(SCRIPT_DIR, "token.json")
+SERVER_URL = (os.environ.get("SERVER_URL") or "http://localhost:8080").rstrip("/")
+PORT = int(os.environ.get("PORT") or 8080)
+MCP_TRANSPORT = (os.environ.get("MCP_TRANSPORT") or "sse").lower()
 
-# Environment variable to skip OAuth authentication
-SKIP_OAUTH = os.environ.get("GSC_SKIP_OAUTH", "").lower() in ("true", "1", "yes")
+OAUTH_CLIENT_ID = os.environ.get("GSC_OAUTH_CLIENT_ID") or ""
+OAUTH_CLIENT_SECRET = os.environ.get("GSC_OAUTH_CLIENT_SECRET") or ""
+OAUTH_PROJECT_ID = os.environ.get("GSC_OAUTH_PROJECT_ID") or ""
+OAUTH_AUTH_URI = (
+    os.environ.get("GSC_OAUTH_AUTH_URI")
+    or "https://accounts.google.com/o/oauth2/auth"
+)
+OAUTH_TOKEN_URI = (
+    os.environ.get("GSC_OAUTH_TOKEN_URI")
+    or "https://oauth2.googleapis.com/token"
+)
+OAUTH_AUTH_PROVIDER_CERT_URL = (
+    os.environ.get("GSC_OAUTH_AUTH_PROVIDER_CERT_URL")
+    or "https://www.googleapis.com/oauth2/v1/certs"
+)
+OAUTH_JAVASCRIPT_ORIGINS = os.environ.get("GSC_OAUTH_JAVASCRIPT_ORIGINS") or ""
 
-# Data state for search analytics queries.
-# "all"   → includes fresh/unconfirmed data, matches the GSC dashboard (default)
-# "final" → only confirmed data, which lags 2-3 days behind the dashboard
+REDIRECT_URI = f"{SERVER_URL}/oauth/callback"
+
+
+def _build_web_client_config() -> dict:
+    """Build the OAuth client config dict (web app) from env vars — mirrors client_secrets.json structure."""
+    config: dict = {
+        "client_id": OAUTH_CLIENT_ID,
+        "client_secret": OAUTH_CLIENT_SECRET,
+        "auth_uri": OAUTH_AUTH_URI,
+        "token_uri": OAUTH_TOKEN_URI,
+        "auth_provider_x509_cert_url": OAUTH_AUTH_PROVIDER_CERT_URL,
+        "redirect_uris": [REDIRECT_URI],
+    }
+    if OAUTH_PROJECT_ID:
+        config["project_id"] = OAUTH_PROJECT_ID
+    if OAUTH_JAVASCRIPT_ORIGINS:
+        config["javascript_origins"] = [OAUTH_JAVASCRIPT_ORIGINS]
+    return {"web": config}
+
+
+def _build_installed_client_config() -> dict:
+    """Build the OAuth client config dict (desktop/installed app) from env vars — mirrors client_secrets.json structure."""
+    config: dict = {
+        "client_id": OAUTH_CLIENT_ID,
+        "client_secret": OAUTH_CLIENT_SECRET,
+        "auth_uri": OAUTH_AUTH_URI,
+        "token_uri": OAUTH_TOKEN_URI,
+        "auth_provider_x509_cert_url": OAUTH_AUTH_PROVIDER_CERT_URL,
+        "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob", "http://localhost"],
+    }
+    if OAUTH_PROJECT_ID:
+        config["project_id"] = OAUTH_PROJECT_ID
+    return {"installed": config}
+
 _raw_data_state = os.environ.get("GSC_DATA_STATE", "all").lower().strip()
 if _raw_data_state not in ("all", "final"):
     raise ValueError(
@@ -58,21 +120,160 @@ DATA_STATE = _raw_data_state
 
 SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"]
 
+# ─── Per-request user context ──────────────────────────────────────────────────
+
+# Holds the current user's API key for the duration of an MCP request.
+current_user_key: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "current_user_key", default=None
+)
+
+
+# ─── Token / file helpers ──────────────────────────────────────────────────────
+
+def _tokens_dir() -> str:
+    d = os.path.join(DATA_DIR, "tokens")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _sanitize_key(key: str) -> str:
+    """Allow only alphanumeric, dash, underscore to prevent path traversal."""
+    return re.sub(r"[^A-Za-z0-9_\-]", "", key)
+
+
+def _token_file(user_key: str) -> str:
+    return os.path.join(_tokens_dir(), f"{_sanitize_key(user_key)}.json")
+
+
+# ─── OAuth state persistence ───────────────────────────────────────────────────
+# States are written to disk so they survive a server restart mid-flow.
+
+_STATES_FILE = os.path.join(DATA_DIR, "oauth_states.json")
+_STATE_TTL_SECONDS = 600  # 10 minutes
+
+
+def _load_states() -> dict:
+    if not os.path.exists(_STATES_FILE):
+        return {}
+    try:
+        with open(_STATES_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_states(states: dict) -> None:
+    with open(_STATES_FILE, "w") as f:
+        json.dump(states, f)
+
+
+def _create_oauth_state(user_key: str) -> str:
+    state = secrets.token_urlsafe(32)
+    states = _load_states()
+    # Prune expired states
+    now = datetime.utcnow().timestamp()
+    states = {k: v for k, v in states.items()
+               if now - v.get("ts", 0) < _STATE_TTL_SECONDS}
+    states[state] = {"user_key": user_key, "ts": now}
+    _save_states(states)
+    return state
+
+
+def _consume_oauth_state(state: str) -> Optional[dict]:
+    """Return the full state entry and remove it, or None if invalid/expired."""
+    states = _load_states()
+    entry = states.pop(state, None)
+    _save_states(states)
+    if not entry:
+        return None
+    age = datetime.utcnow().timestamp() - entry.get("ts", 0)
+    if age > _STATE_TTL_SECONDS:
+        return None
+    return entry
+
+
+# ─── Auth ──────────────────────────────────────────────────────────────────────
+
 def get_gsc_service():
     """
     Returns an authorized Search Console service object.
-    First tries OAuth authentication, then falls back to service account.
+
+    In SSE/multi-tenant mode: uses the current request's API key to locate
+    the user's stored OAuth token.
+
+    In stdio mode: falls back to local OAuth flow or service account (legacy).
     """
-    # Try OAuth authentication first if not skipped
+    if MCP_TRANSPORT == "stdio":
+        return _get_gsc_service_stdio()
+
+    user_key = current_user_key.get()
+    if not user_key:
+        raise RuntimeError(
+            "No API key found in this connection. "
+            "Make sure you configured your Claude Desktop with ?key=<your-api-key>."
+        )
+    return _get_gsc_service_for_key(user_key)
+
+
+def _get_gsc_service_for_key(user_key: str):
+    """Load (or refresh) credentials for a specific user key."""
+    token_file = _token_file(user_key)
+    creds = None
+
+    if os.path.exists(token_file):
+        try:
+            creds = Credentials.from_authorized_user_file(token_file, SCOPES)
+        except Exception:
+            logger.warning("Token file for key ...%s is corrupt — deleting", user_key[-6:])
+            os.remove(token_file)
+            creds = None
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                logger.info("Refreshing expired token for key ...%s", user_key[-6:])
+                creds.refresh(GoogleRequest())
+                with open(token_file, "w") as f:
+                    f.write(creds.to_json())
+                logger.info("Token refreshed successfully for key ...%s", user_key[-6:])
+            except Exception as e:
+                logger.warning("Token refresh failed for key ...%s: %s", user_key[-6:], e)
+                if os.path.exists(token_file):
+                    os.remove(token_file)
+                creds = None
+
+        if not creds or not creds.valid:
+            logger.warning("No valid credentials for key ...%s — re-auth required", user_key[-6:])
+            raise RuntimeError(
+                f"Your Google authorization has expired or was never completed.\n\n"
+                f"Please visit this URL to re-authorize:\n\n"
+                f"  {SERVER_URL}/setup?key={user_key}\n\n"
+                f"Make sure you are signed into the correct Google account in your browser first."
+            )
+
+    return build("searchconsole", "v1", credentials=creds, cache_discovery=False)
+
+
+# ─── Legacy stdio auth (unchanged from original) ───────────────────────────────
+
+# Path to service account / OAuth token for local/stdio mode
+GSC_CREDENTIALS_PATH = os.environ.get("GSC_CREDENTIALS_PATH")
+POSSIBLE_CREDENTIAL_PATHS = [
+    GSC_CREDENTIALS_PATH,
+    os.path.join(DATA_DIR, "service_account_credentials.json"),
+    os.path.join(SCRIPT_DIR, "service_account_credentials.json"),
+]
+TOKEN_FILE = os.path.join(DATA_DIR, "token.json")
+SKIP_OAUTH = (os.environ.get("GSC_SKIP_OAUTH") or "").lower() in ("true", "1", "yes")
+
+
+def _get_gsc_service_stdio():
     if not SKIP_OAUTH:
         try:
-            return get_gsc_service_oauth()
+            return _get_gsc_service_oauth_stdio()
         except Exception as e:
-            # If OAuth fails, try service account
             print(f"OAuth authentication failed: {str(e)}")
-            pass
-    
-    # Try service account authentication
+
     for cred_path in POSSIBLE_CREDENTIAL_PATHS:
         if cred_path and os.path.exists(cred_path):
             try:
@@ -80,71 +281,55 @@ def get_gsc_service():
                     cred_path, scopes=SCOPES
                 )
                 return build("searchconsole", "v1", credentials=creds, cache_discovery=False)
-            except Exception as e:
-                continue  # Try the next path if this one fails
-    
-    # If we get here, none of the authentication methods worked
+            except Exception:
+                continue
+
     raise FileNotFoundError(
-        f"Authentication failed. Please either:\n"
-        f"1. Set up OAuth by placing a client_secrets.json file in the script directory, or\n"
-        f"2. Set the GSC_CREDENTIALS_PATH environment variable or place a service account credentials file in one of these locations: "
+        "Authentication failed. Please either:\n"
+        "1. Set GSC_OAUTH_CLIENT_ID and GSC_OAUTH_CLIENT_SECRET in your .env file, or\n"
+        "2. Set the GSC_CREDENTIALS_PATH environment variable or place a service account "
+        "credentials file in one of these locations: "
         f"{', '.join([p for p in POSSIBLE_CREDENTIAL_PATHS[1:] if p])}"
     )
 
-def get_gsc_service_oauth():
-    """
-    Returns an authorized Search Console service object using OAuth.
-    """
+
+def _get_gsc_service_oauth_stdio():
     creds = None
-    
-    # Check if token file exists
     if os.path.exists(TOKEN_FILE):
         try:
             creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
-        except Exception as e:
-            # If token file is corrupted, delete it
+        except Exception:
             if os.path.exists(TOKEN_FILE):
                 os.remove(TOKEN_FILE)
             creds = None
-    
-    # If credentials don't exist or are invalid, get new ones
+
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             try:
-                creds.refresh(Request())
-                # Save the refreshed credentials
-                with open(TOKEN_FILE, 'w') as token:
+                creds.refresh(GoogleRequest())
+                with open(TOKEN_FILE, "w") as token:
                     token.write(creds.to_json())
-            except Exception as e:
-                # If refresh fails, delete the bad token and trigger new OAuth flow
+            except Exception:
                 if os.path.exists(TOKEN_FILE):
                     os.remove(TOKEN_FILE)
-                # Fall through to the OAuth flow below
                 creds = None
-        
-        # Start new OAuth flow if we don't have valid credentials
-        if not creds or not creds.valid:
-            # Check if client secrets file exists
-            if not os.path.exists(OAUTH_CLIENT_SECRETS_FILE):
-                raise FileNotFoundError(
-                    f"OAuth client secrets file not found. Please place a client_secrets.json file in the script directory "
-                    f"or set the GSC_OAUTH_CLIENT_SECRETS_FILE environment variable."
-                )
-            
-            # Start OAuth flow
-            flow = InstalledAppFlow.from_client_secrets_file(OAUTH_CLIENT_SECRETS_FILE, SCOPES)
-            creds = flow.run_local_server(port=8080)
 
-            # Save the credentials for future use
-            with open(TOKEN_FILE, 'w') as token:
+        if not creds or not creds.valid:
+            if not OAUTH_CLIENT_ID or not OAUTH_CLIENT_SECRET:
+                raise RuntimeError(
+                    "GSC_OAUTH_CLIENT_ID and GSC_OAUTH_CLIENT_SECRET must be set in .env."
+                )
+            flow = InstalledAppFlow.from_client_config(_build_installed_client_config(), SCOPES)
+            creds = flow.run_local_server(port=8080)
+            with open(TOKEN_FILE, "w") as token:
                 token.write(creds.to_json())
-    
-    # Build and return the service
+
     return build("searchconsole", "v1", credentials=creds, cache_discovery=False)
 
 
+# ─── Shared helpers ────────────────────────────────────────────────────────────
+
 def _site_not_found_error(site_url: str) -> str:
-    """Return a helpful message when a GSC property returns 404."""
     lines = [f"Property '{site_url}' not found (404). Possible causes:\n"]
     lines.append(
         "1. The site_url doesn't exactly match what is in GSC. "
@@ -161,11 +346,11 @@ def _site_not_found_error(site_url: str) -> str:
             "2. If your property is a domain property (covers all subdomains), "
             "the correct format is 'sc-domain:example.com', not a full URL."
         )
-    lines.append(
-        "3. The authenticated account may not have access to this property."
-    )
+    lines.append("3. The authenticated account may not have access to this property.")
     return "\n".join(lines)
 
+
+# ─── MCP Tools ─────────────────────────────────────────────────────────────────
 
 @mcp.tool()
 async def list_properties() -> str:
@@ -175,20 +360,11 @@ async def list_properties() -> str:
     try:
         service = get_gsc_service()
         site_list = service.sites().list().execute()
-
-        # site_list is typically something like:
-        # {
-        #   "siteEntry": [
-        #       {"siteUrl": "...", "permissionLevel": "..."},
-        #       ...
-        #   ]
-        # }
         sites = site_list.get("siteEntry", [])
 
         if not sites:
             return "No Search Console properties found."
 
-        # Format the results for easy reading
         lines = []
         for site in sites:
             site_url = site.get("siteUrl", "Unknown")
@@ -208,67 +384,63 @@ async def list_properties() -> str:
     except Exception as e:
         return f"Error retrieving properties: {str(e)}"
 
+
 @mcp.tool()
 async def add_site(site_url: str) -> str:
     """
     Add a site to your Search Console properties.
-    
+
     Args:
         site_url: The URL of the site to add (must be exact match e.g. https://example.com, or https://www.example.com, or https://subdomain.example.com/path/, for domain properties use format: sc-domain:example.com)
     """
     try:
         service = get_gsc_service()
-        
-        # Add the site
         response = service.sites().add(siteUrl=site_url).execute()
-        
-        # Format the response
+
         result_lines = [f"Site {site_url} has been added to Search Console."]
-        
-        # Add permission level if available
         if "permissionLevel" in response:
             result_lines.append(f"Permission level: {response['permissionLevel']}")
-        
         return "\n".join(result_lines)
     except HttpError as e:
-        error_content = json.loads(e.content.decode('utf-8'))
-        error_details = error_content.get('error', {})
+        error_content = json.loads(e.content.decode("utf-8"))
+        error_details = error_content.get("error", {})
         error_code = e.resp.status
-        error_message = error_details.get('message', str(e))
-        error_reason = error_details.get('errors', [{}])[0].get('reason', '')
-        
+        error_message = error_details.get("message", str(e))
+        error_reason = error_details.get("errors", [{}])[0].get("reason", "")
+
         if error_code == 409:
             return f"Site {site_url} is already added to Search Console."
         elif error_code == 403:
-            if error_reason == 'forbidden':
-                return f"Error: You don't have permission to add this site. Please verify ownership first."
-            elif error_reason == 'quotaExceeded':
-                return f"Error: API quota exceeded. Please try again later."
+            if error_reason == "forbidden":
+                return "Error: You don't have permission to add this site. Please verify ownership first."
+            elif error_reason == "quotaExceeded":
+                return "Error: API quota exceeded. Please try again later."
             else:
                 return f"Error: Permission denied. {error_message}"
         elif error_code == 400:
-            if error_reason == 'invalidParameter':
-                return f"Error: Invalid site URL format. Please check the URL format and try again."
+            if error_reason == "invalidParameter":
+                return "Error: Invalid site URL format. Please check the URL format and try again."
             else:
                 return f"Error: Bad request. {error_message}"
         elif error_code == 401:
-            return f"Error: Unauthorized. Please check your credentials."
+            return "Error: Unauthorized. Please check your credentials."
         elif error_code == 429:
-            return f"Error: Too many requests. Please try again later."
+            return "Error: Too many requests. Please try again later."
         elif error_code == 500:
-            return f"Error: Internal server error from Google Search Console API. Please try again later."
+            return "Error: Internal server error from Google Search Console API. Please try again later."
         elif error_code == 503:
-            return f"Error: Service unavailable. Google Search Console API is currently down. Please try again later."
+            return "Error: Service unavailable. Google Search Console API is currently down. Please try again later."
         else:
             return f"Error adding site (HTTP {error_code}): {error_message}"
     except Exception as e:
         return f"Error adding site: {str(e)}"
 
+
 @mcp.tool()
 async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = "query", row_limit: int = 20) -> str:
     """
     Get search analytics data for a specific property.
-    
+
     Args:
         site_url: Exact GSC property URL from list_properties (e.g. "https://example.com/" or
                   "sc-domain:example.com"). Domain properties cover all subdomains — use the
@@ -282,67 +454,52 @@ async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = 
     """
     try:
         service = get_gsc_service()
-        
-        # Calculate date range
+
         end_date = datetime.now().date()
         start_date = end_date - timedelta(days=days)
-        
-        # Parse dimensions
         dimension_list = [d.strip() for d in dimensions.split(",")]
-        
-        # Build request
+
         request = {
             "startDate": start_date.strftime("%Y-%m-%d"),
             "endDate": end_date.strftime("%Y-%m-%d"),
             "dimensions": dimension_list,
             "rowLimit": min(max(1, row_limit), 500),
-            "dataState": DATA_STATE
+            "dataState": DATA_STATE,
         }
-        
-        # Execute request
+
         response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
-        
+
         if not response.get("rows"):
             return f"No search analytics data found for {site_url} in the last {days} days."
-        
-        # Format results
+
         result_lines = [f"Search analytics for {site_url} (last {days} days):"]
         result_lines.append("\n" + "-" * 80 + "\n")
-        
-        # Create header based on dimensions
-        header = []
-        for dim in dimension_list:
-            header.append(dim.capitalize())
+
+        header = [dim.capitalize() for dim in dimension_list]
         header.extend(["Clicks", "Impressions", "CTR", "Position"])
         result_lines.append(" | ".join(header))
         result_lines.append("-" * 80)
-        
-        # Add data rows
+
         for row in response.get("rows", []):
-            data = []
-            # Add dimension values
-            for dim_value in row.get("keys", []):
-                data.append(dim_value[:100])  # Increased truncation limit to 100 characters
-            
-            # Add metrics
+            data = [dim_value[:100] for dim_value in row.get("keys", [])]
             data.append(str(row.get("clicks", 0)))
             data.append(str(row.get("impressions", 0)))
             data.append(f"{row.get('ctr', 0) * 100:.2f}%")
             data.append(f"{row.get('position', 0):.1f}")
-            
             result_lines.append(" | ".join(data))
-        
+
         return "\n".join(result_lines)
     except Exception as e:
         if "404" in str(e):
             return _site_not_found_error(site_url)
         return f"Error retrieving search analytics: {str(e)}"
 
+
 @mcp.tool()
 async def get_site_details(site_url: str) -> str:
     """
     Get detailed information about a specific Search Console property.
-    
+
     Args:
         site_url: Exact GSC property URL from list_properties (e.g. "https://example.com/" or
                   "sc-domain:example.com"). Domain properties cover all subdomains — use the
@@ -350,46 +507,36 @@ async def get_site_details(site_url: str) -> str:
     """
     try:
         service = get_gsc_service()
-        
-        # Get site details
         site_info = service.sites().get(siteUrl=site_url).execute()
-        
-        # Format the results
-        result_lines = [f"Site details for {site_url}:"]
-        result_lines.append("-" * 50)
-        
-        # Add basic info
+
+        result_lines = [f"Site details for {site_url}:", "-" * 50]
         result_lines.append(f"Permission level: {site_info.get('permissionLevel', 'Unknown')}")
-        
-        # Add verification info if available
+
         if "siteVerificationInfo" in site_info:
             verify_info = site_info["siteVerificationInfo"]
             result_lines.append(f"Verification state: {verify_info.get('verificationState', 'Unknown')}")
-            
             if "verifiedUser" in verify_info:
                 result_lines.append(f"Verified by: {verify_info['verifiedUser']}")
-                
             if "verificationMethod" in verify_info:
                 result_lines.append(f"Verification method: {verify_info['verificationMethod']}")
-        
-        # Add ownership info if available
+
         if "ownershipInfo" in site_info:
             owner_info = site_info["ownershipInfo"]
             result_lines.append("\nOwnership Information:")
             result_lines.append(f"Owner: {owner_info.get('owner', 'Unknown')}")
-            
             if "verificationMethod" in owner_info:
                 result_lines.append(f"Ownership verification: {owner_info['verificationMethod']}")
-        
+
         return "\n".join(result_lines)
     except Exception as e:
         return f"Error retrieving site details: {str(e)}"
+
 
 @mcp.tool()
 async def get_sitemaps(site_url: str) -> str:
     """
     List all sitemaps for a specific Search Console property.
-    
+
     Args:
         site_url: Exact GSC property URL from list_properties (e.g. "https://example.com/" or
                   "sc-domain:example.com"). Domain properties cover all subdomains — use the
@@ -397,64 +544,48 @@ async def get_sitemaps(site_url: str) -> str:
     """
     try:
         service = get_gsc_service()
-        
-        # Get sitemaps list
         sitemaps = service.sitemaps().list(siteUrl=site_url).execute()
-        
+
         if not sitemaps.get("sitemap"):
             return f"No sitemaps found for {site_url}."
-        
-        # Format the results
-        result_lines = [f"Sitemaps for {site_url}:"]
-        result_lines.append("-" * 80)
-        
-        # Header
-        result_lines.append("Path | Last Downloaded | Status | Indexed URLs | Errors")
-        result_lines.append("-" * 80)
-        
-        # Add each sitemap
+
+        result_lines = [f"Sitemaps for {site_url}:", "-" * 80,
+                        "Path | Last Downloaded | Status | Indexed URLs | Errors", "-" * 80]
+
         for sitemap in sitemaps.get("sitemap", []):
             path = sitemap.get("path", "Unknown")
             last_downloaded = sitemap.get("lastDownloaded", "Never")
-            
-            # Format last downloaded date if it exists
             if last_downloaded != "Never":
                 try:
-                    # Convert to more readable format
-                    dt = datetime.fromisoformat(last_downloaded.replace('Z', '+00:00'))
+                    dt = datetime.fromisoformat(last_downloaded.replace("Z", "+00:00"))
                     last_downloaded = dt.strftime("%Y-%m-%d %H:%M")
-                except:
+                except Exception:
                     pass
-            
-            status = "Valid"
-            if "errors" in sitemap and int(sitemap["errors"]) > 0:
-                status = "Has errors"
-            
-            # Get counts
-            warnings = int(sitemap.get("warnings", 0))
+
+            status = "Has errors" if int(sitemap.get("errors", 0)) > 0 else "Valid"
             errors = int(sitemap.get("errors", 0))
 
-            # Get contents if available
             indexed_urls = "N/A"
             if "contents" in sitemap:
                 for content in sitemap["contents"]:
                     if content.get("type") == "web":
                         indexed_urls = content.get("submitted", "0")
                         break
-            
+
             result_lines.append(f"{path} | {last_downloaded} | {status} | {indexed_urls} | {errors}")
-        
+
         return "\n".join(result_lines)
     except Exception as e:
         if "404" in str(e):
             return _site_not_found_error(site_url)
         return f"Error retrieving sitemaps: {str(e)}"
 
+
 @mcp.tool()
 async def inspect_url_enhanced(site_url: str, page_url: str) -> str:
     """
     Enhanced URL inspection to check indexing status and rich results in Google.
-    
+
     Args:
         site_url: Exact GSC property URL from list_properties (e.g. "https://example.com/" or
                   "sc-domain:example.com"). Domain properties cover all subdomains — use the
@@ -463,120 +594,79 @@ async def inspect_url_enhanced(site_url: str, page_url: str) -> str:
     """
     try:
         service = get_gsc_service()
-        
-        # Build request
-        request = {
-            "inspectionUrl": page_url,
-            "siteUrl": site_url
-        }
-        
-        # Execute request
+        request = {"inspectionUrl": page_url, "siteUrl": site_url}
         response = service.urlInspection().index().inspect(body=request).execute()
-        
+
         if not response or "inspectionResult" not in response:
             return f"No inspection data found for {page_url}."
-        
+
         inspection = response["inspectionResult"]
-        
-        # Format the results
-        result_lines = [f"URL Inspection for {page_url}:"]
-        result_lines.append("-" * 80)
-        
-        # Add inspection result link if available
+        result_lines = [f"URL Inspection for {page_url}:", "-" * 80]
+
         if "inspectionResultLink" in inspection:
             result_lines.append(f"Search Console Link: {inspection['inspectionResultLink']}")
             result_lines.append("-" * 80)
-        
-        # Indexing status section
+
         index_status = inspection.get("indexStatusResult", {})
         verdict = index_status.get("verdict", "UNKNOWN")
-        
         result_lines.append(f"Indexing Status: {verdict}")
-        
-        # Coverage state
+
         if "coverageState" in index_status:
             result_lines.append(f"Coverage: {index_status['coverageState']}")
-        
-        # Last crawl
+
         if "lastCrawlTime" in index_status:
             try:
-                crawl_time = datetime.fromisoformat(index_status["lastCrawlTime"].replace('Z', '+00:00'))
+                crawl_time = datetime.fromisoformat(index_status["lastCrawlTime"].replace("Z", "+00:00"))
                 result_lines.append(f"Last Crawled: {crawl_time.strftime('%Y-%m-%d %H:%M')}")
-            except:
+            except Exception:
                 result_lines.append(f"Last Crawled: {index_status['lastCrawlTime']}")
-        
-        # Page fetch
-        if "pageFetchState" in index_status:
-            result_lines.append(f"Page Fetch: {index_status['pageFetchState']}")
-        
-        # Robots.txt status
-        if "robotsTxtState" in index_status:
-            result_lines.append(f"Robots.txt: {index_status['robotsTxtState']}")
-        
-        # Indexing state
-        if "indexingState" in index_status:
-            result_lines.append(f"Indexing State: {index_status['indexingState']}")
-        
-        # Canonical information
-        if "googleCanonical" in index_status:
-            result_lines.append(f"Google Canonical: {index_status['googleCanonical']}")
-        
+
+        for field, label in [
+            ("pageFetchState", "Page Fetch"),
+            ("robotsTxtState", "Robots.txt"),
+            ("indexingState", "Indexing State"),
+            ("googleCanonical", "Google Canonical"),
+            ("crawledAs", "Crawled As"),
+        ]:
+            if field in index_status:
+                result_lines.append(f"{label}: {index_status[field]}")
+
         if "userCanonical" in index_status and index_status.get("userCanonical") != index_status.get("googleCanonical"):
             result_lines.append(f"User Canonical: {index_status['userCanonical']}")
-        
-        # Crawled as
-        if "crawledAs" in index_status:
-            result_lines.append(f"Crawled As: {index_status['crawledAs']}")
-        
-        # Referring URLs
+
         if "referringUrls" in index_status and index_status["referringUrls"]:
             result_lines.append("\nReferring URLs:")
-            for url in index_status["referringUrls"][:5]:  # Limit to 5 examples
+            for url in index_status["referringUrls"][:5]:
                 result_lines.append(f"- {url}")
-            
             if len(index_status["referringUrls"]) > 5:
                 result_lines.append(f"... and {len(index_status['referringUrls']) - 5} more")
-        
-        # Rich results
+
         if "richResultsResult" in inspection:
             rich = inspection["richResultsResult"]
             result_lines.append(f"\nRich Results: {rich.get('verdict', 'UNKNOWN')}")
-            
             if "detectedItems" in rich and rich["detectedItems"]:
                 result_lines.append("Detected Rich Result Types:")
-                
                 for item in rich["detectedItems"]:
-                    rich_type = item.get("richResultType", "Unknown")
-                    result_lines.append(f"- {rich_type}")
-                    
-                    # If there are items with names, show them
+                    result_lines.append(f"- {item.get('richResultType', 'Unknown')}")
                     if "items" in item and item["items"]:
-                        for i, subitem in enumerate(item["items"][:3]):  # Limit to 3 examples
+                        for subitem in item["items"][:3]:
                             if "name" in subitem:
                                 result_lines.append(f"  • {subitem['name']}")
-                        
                         if len(item["items"]) > 3:
                             result_lines.append(f"  • ... and {len(item['items']) - 3} more items")
-            
-            # Check for issues
-            if "richResultsIssues" in rich and rich["richResultsIssues"]:
-                result_lines.append("\nRich Results Issues:")
-                for issue in rich["richResultsIssues"]:
-                    severity = issue.get("severity", "Unknown")
-                    message = issue.get("message", "Unknown issue")
-                    result_lines.append(f"- [{severity}] {message}")
-        
+
         return "\n".join(result_lines)
     except Exception as e:
         if "404" in str(e):
             return _site_not_found_error(site_url)
         return f"Error inspecting URL: {str(e)}"
 
+
 @mcp.tool()
 async def batch_url_inspection(site_url: str, urls: str) -> str:
     """
     Inspect multiple URLs in batch (within API limits).
-    
+
     Args:
         site_url: Exact GSC property URL from list_properties (e.g. "https://example.com/" or
                   "sc-domain:example.com"). Domain properties cover all subdomains — use the
@@ -585,74 +675,61 @@ async def batch_url_inspection(site_url: str, urls: str) -> str:
     """
     try:
         service = get_gsc_service()
-        
-        # Parse URLs
-        url_list = [url.strip() for url in urls.split('\n') if url.strip()]
-        
+        url_list = [url.strip() for url in urls.split("\n") if url.strip()]
+
         if not url_list:
             return "No URLs provided for inspection."
-        
         if len(url_list) > 10:
             return f"Too many URLs provided ({len(url_list)}). Please limit to 10 URLs per batch to avoid API quota issues."
-        
-        # Process each URL
+
         results = []
-        
         for page_url in url_list:
-            # Build request
-            request = {
-                "inspectionUrl": page_url,
-                "siteUrl": site_url
-            }
-            
             try:
-                # Execute request with a small delay to avoid rate limits
-                response = service.urlInspection().index().inspect(body=request).execute()
-                
+                response = service.urlInspection().index().inspect(
+                    body={"inspectionUrl": page_url, "siteUrl": site_url}
+                ).execute()
+
                 if not response or "inspectionResult" not in response:
                     results.append(f"{page_url}: No inspection data found")
                     continue
-                
+
                 inspection = response["inspectionResult"]
                 index_status = inspection.get("indexStatusResult", {})
-                
-                # Get key information
                 verdict = index_status.get("verdict", "UNKNOWN")
                 coverage = index_status.get("coverageState", "Unknown")
+
                 last_crawl = "Never"
-                
                 if "lastCrawlTime" in index_status:
                     try:
-                        crawl_time = datetime.fromisoformat(index_status["lastCrawlTime"].replace('Z', '+00:00'))
-                        last_crawl = crawl_time.strftime('%Y-%m-%d')
-                    except:
+                        crawl_time = datetime.fromisoformat(index_status["lastCrawlTime"].replace("Z", "+00:00"))
+                        last_crawl = crawl_time.strftime("%Y-%m-%d")
+                    except Exception:
                         last_crawl = index_status["lastCrawlTime"]
-                
-                # Check for rich results
+
                 rich_results = "None"
                 if "richResultsResult" in inspection:
                     rich = inspection["richResultsResult"]
-                    if rich.get("verdict") == "PASS" and "detectedItems" in rich and rich["detectedItems"]:
-                        rich_types = [item.get("richResultType", "Unknown") for item in rich["detectedItems"]]
-                        rich_results = ", ".join(rich_types)
-                
-                # Format result
-                results.append(f"{page_url}:\n  Status: {verdict} - {coverage}\n  Last Crawl: {last_crawl}\n  Rich Results: {rich_results}\n")
-            
+                    if rich.get("verdict") == "PASS" and rich.get("detectedItems"):
+                        rich_results = ", ".join(
+                            item.get("richResultType", "Unknown") for item in rich["detectedItems"]
+                        )
+
+                results.append(
+                    f"{page_url}:\n  Status: {verdict} - {coverage}\n  Last Crawl: {last_crawl}\n  Rich Results: {rich_results}\n"
+                )
             except Exception as e:
                 results.append(f"{page_url}: Error - {str(e)}")
-        
-        # Combine results
+
         return f"Batch URL Inspection Results for {site_url}:\n\n" + "\n".join(results)
-    
     except Exception as e:
         return f"Error performing batch inspection: {str(e)}"
+
 
 @mcp.tool()
 async def check_indexing_issues(site_url: str, urls: str) -> str:
     """
     Check for specific indexing issues across multiple URLs.
-    
+
     Args:
         site_url: Exact GSC property URL from list_properties (e.g. "https://example.com/" or
                   "sc-domain:example.com"). Domain properties cover all subdomains — use the
@@ -661,119 +738,85 @@ async def check_indexing_issues(site_url: str, urls: str) -> str:
     """
     try:
         service = get_gsc_service()
-        
-        # Parse URLs
-        url_list = [url.strip() for url in urls.split('\n') if url.strip()]
-        
+        url_list = [url.strip() for url in urls.split("\n") if url.strip()]
+
         if not url_list:
             return "No URLs provided for inspection."
-        
         if len(url_list) > 10:
             return f"Too many URLs provided ({len(url_list)}). Please limit to 10 URLs per batch to avoid API quota issues."
-        
-        # Track issues by category
+
         issues_summary = {
-            "not_indexed": [],
-            "canonical_issues": [],
-            "robots_blocked": [],
-            "fetch_issues": [],
-            "indexed": []
+            "not_indexed": [], "canonical_issues": [],
+            "robots_blocked": [], "fetch_issues": [], "indexed": [],
         }
-        
-        # Process each URL
+
         for page_url in url_list:
-            # Build request
-            request = {
-                "inspectionUrl": page_url,
-                "siteUrl": site_url
-            }
-            
             try:
-                # Execute request
-                response = service.urlInspection().index().inspect(body=request).execute()
-                
+                response = service.urlInspection().index().inspect(
+                    body={"inspectionUrl": page_url, "siteUrl": site_url}
+                ).execute()
+
                 if not response or "inspectionResult" not in response:
                     issues_summary["not_indexed"].append(f"{page_url} - No inspection data found")
                     continue
-                
+
                 inspection = response["inspectionResult"]
                 index_status = inspection.get("indexStatusResult", {})
-                
-                # Check indexing status
                 verdict = index_status.get("verdict", "UNKNOWN")
                 coverage = index_status.get("coverageState", "Unknown")
-                
+
                 if verdict != "PASS" or "not indexed" in coverage.lower() or "excluded" in coverage.lower():
                     issues_summary["not_indexed"].append(f"{page_url} - {coverage}")
                 else:
                     issues_summary["indexed"].append(page_url)
-                
-                # Check canonical issues
+
                 google_canonical = index_status.get("googleCanonical", "")
                 user_canonical = index_status.get("userCanonical", "")
-                
                 if google_canonical and user_canonical and google_canonical != user_canonical:
                     issues_summary["canonical_issues"].append(
                         f"{page_url} - Google chose: {google_canonical} instead of user-declared: {user_canonical}"
                     )
-                
-                # Check robots.txt status
-                robots_state = index_status.get("robotsTxtState", "")
-                if robots_state == "BLOCKED":
+
+                if index_status.get("robotsTxtState") == "BLOCKED":
                     issues_summary["robots_blocked"].append(page_url)
-                
-                # Check fetch issues
+
                 fetch_state = index_status.get("pageFetchState", "")
                 if fetch_state != "SUCCESSFUL":
                     issues_summary["fetch_issues"].append(f"{page_url} - {fetch_state}")
-            
             except Exception as e:
                 issues_summary["not_indexed"].append(f"{page_url} - Error: {str(e)}")
-        
-        # Format results
-        result_lines = [f"Indexing Issues Report for {site_url}:"]
-        result_lines.append("-" * 80)
-        
-        # Summary counts
-        result_lines.append(f"Total URLs checked: {len(url_list)}")
-        result_lines.append(f"Indexed: {len(issues_summary['indexed'])}")
-        result_lines.append(f"Not indexed: {len(issues_summary['not_indexed'])}")
-        result_lines.append(f"Canonical issues: {len(issues_summary['canonical_issues'])}")
-        result_lines.append(f"Robots.txt blocked: {len(issues_summary['robots_blocked'])}")
-        result_lines.append(f"Fetch issues: {len(issues_summary['fetch_issues'])}")
-        result_lines.append("-" * 80)
-        
-        # Detailed issues
+
+        result_lines = [f"Indexing Issues Report for {site_url}:", "-" * 80,
+                        f"Total URLs checked: {len(url_list)}",
+                        f"Indexed: {len(issues_summary['indexed'])}",
+                        f"Not indexed: {len(issues_summary['not_indexed'])}",
+                        f"Canonical issues: {len(issues_summary['canonical_issues'])}",
+                        f"Robots.txt blocked: {len(issues_summary['robots_blocked'])}",
+                        f"Fetch issues: {len(issues_summary['fetch_issues'])}", "-" * 80]
+
         if issues_summary["not_indexed"]:
             result_lines.append("\nNot Indexed URLs:")
-            for issue in issues_summary["not_indexed"]:
-                result_lines.append(f"- {issue}")
-        
+            result_lines.extend(f"- {i}" for i in issues_summary["not_indexed"])
         if issues_summary["canonical_issues"]:
             result_lines.append("\nCanonical Issues:")
-            for issue in issues_summary["canonical_issues"]:
-                result_lines.append(f"- {issue}")
-        
+            result_lines.extend(f"- {i}" for i in issues_summary["canonical_issues"])
         if issues_summary["robots_blocked"]:
             result_lines.append("\nRobots.txt Blocked URLs:")
-            for url in issues_summary["robots_blocked"]:
-                result_lines.append(f"- {url}")
-        
+            result_lines.extend(f"- {u}" for u in issues_summary["robots_blocked"])
         if issues_summary["fetch_issues"]:
             result_lines.append("\nFetch Issues:")
-            for issue in issues_summary["fetch_issues"]:
-                result_lines.append(f"- {issue}")
-        
+            result_lines.extend(f"- {i}" for i in issues_summary["fetch_issues"])
+
         return "\n".join(result_lines)
-    
     except Exception as e:
         return f"Error checking indexing issues: {str(e)}"
+
 
 @mcp.tool()
 async def get_performance_overview(site_url: str, days: int = 28) -> str:
     """
     Get a performance overview for a specific property.
-    
+
     Args:
         site_url: Exact GSC property URL from list_properties (e.g. "https://example.com/" or
                   "sc-domain:example.com"). Domain properties cover all subdomains — use the
@@ -782,38 +825,25 @@ async def get_performance_overview(site_url: str, days: int = 28) -> str:
     """
     try:
         service = get_gsc_service()
-        
-        # Calculate date range
         end_date = datetime.now().date()
         start_date = end_date - timedelta(days=days)
-        
-        # Get total metrics
-        total_request = {
+
+        base_req = {
             "startDate": start_date.strftime("%Y-%m-%d"),
             "endDate": end_date.strftime("%Y-%m-%d"),
-            "dimensions": [],  # No dimensions for totals
-            "rowLimit": 1,
-            "dataState": DATA_STATE
+            "dataState": DATA_STATE,
         }
-        
-        total_response = service.searchanalytics().query(siteUrl=site_url, body=total_request).execute()
-        
-        # Get by date for trend
-        date_request = {
-            "startDate": start_date.strftime("%Y-%m-%d"),
-            "endDate": end_date.strftime("%Y-%m-%d"),
-            "dimensions": ["date"],
-            "rowLimit": days,
-            "dataState": DATA_STATE
-        }
-        
-        date_response = service.searchanalytics().query(siteUrl=site_url, body=date_request).execute()
-        
-        # Format results
-        result_lines = [f"Performance Overview for {site_url} (last {days} days):"]
-        result_lines.append("-" * 80)
-        
-        # Add total metrics
+
+        total_response = service.searchanalytics().query(
+            siteUrl=site_url, body={**base_req, "dimensions": [], "rowLimit": 1}
+        ).execute()
+
+        date_response = service.searchanalytics().query(
+            siteUrl=site_url, body={**base_req, "dimensions": ["date"], "rowLimit": days}
+        ).execute()
+
+        result_lines = [f"Performance Overview for {site_url} (last {days} days):", "-" * 80]
+
         if total_response.get("rows"):
             row = total_response["rows"][0]
             result_lines.append(f"Total Clicks: {row.get('clicks', 0):,}")
@@ -823,58 +853,51 @@ async def get_performance_overview(site_url: str, days: int = 28) -> str:
         else:
             result_lines.append("No data available for the selected period.")
             return "\n".join(result_lines)
-        
-        # Add trend data
+
         if date_response.get("rows"):
             result_lines.append("\nDaily Trend:")
             result_lines.append("Date | Clicks | Impressions | CTR | Position")
             result_lines.append("-" * 80)
-            
-            # Sort by date
-            sorted_rows = sorted(date_response["rows"], key=lambda x: x["keys"][0])
-            
-            for row in sorted_rows:
+            for row in sorted(date_response["rows"], key=lambda x: x["keys"][0]):
                 date_str = row["keys"][0]
-                # Format date from YYYY-MM-DD to MM/DD
                 try:
-                    date_obj = datetime.strptime(date_str, "%Y-%m-%d")
-                    date_formatted = date_obj.strftime("%m/%d")
-                except:
+                    date_formatted = datetime.strptime(date_str, "%Y-%m-%d").strftime("%m/%d")
+                except Exception:
                     date_formatted = date_str
-                
-                clicks = row.get("clicks", 0)
-                impressions = row.get("impressions", 0)
-                ctr = row.get("ctr", 0) * 100
-                position = row.get("position", 0)
-                
-                result_lines.append(f"{date_formatted} | {clicks:.0f} | {impressions:.0f} | {ctr:.2f}% | {position:.1f}")
-        
+                result_lines.append(
+                    f"{date_formatted} | {row.get('clicks', 0):.0f} | "
+                    f"{row.get('impressions', 0):.0f} | "
+                    f"{row.get('ctr', 0) * 100:.2f}% | "
+                    f"{row.get('position', 0):.1f}"
+                )
+
         return "\n".join(result_lines)
     except Exception as e:
         if "404" in str(e):
             return _site_not_found_error(site_url)
         return f"Error retrieving performance overview: {str(e)}"
 
+
 @mcp.tool()
 async def get_advanced_search_analytics(
-    site_url: str, 
-    start_date: str = None, 
-    end_date: str = None, 
-    dimensions: str = "query", 
+    site_url: str,
+    start_date: str = None,
+    end_date: str = None,
+    dimensions: str = "query",
     search_type: str = "WEB",
     row_limit: int = 1000,
     start_row: int = 0,
     sort_by: str = "clicks",
     sort_direction: str = "descending",
     filter_dimension: str = None,
-    filter_operator: str = "contains", 
+    filter_operator: str = "contains",
     filter_expression: str = None,
     filters: str = None,
-    data_state: str = None
+    data_state: str = None,
 ) -> str:
     """
     Get advanced search analytics data with sorting, filtering, and pagination.
-    
+
     Args:
         site_url: Exact GSC property URL from list_properties (e.g. "https://example.com/" or
                   "sc-domain:example.com"). Domain properties cover all subdomains — use the
@@ -900,51 +923,40 @@ async def get_advanced_search_analytics(
     """
     try:
         service = get_gsc_service()
-        
-        # Calculate date range if not provided
+
         if not end_date:
             end_date = datetime.now().date().strftime("%Y-%m-%d")
         if not start_date:
             start_date = (datetime.now().date() - timedelta(days=28)).strftime("%Y-%m-%d")
-        
-        # Resolve and validate data_state (per-call override or fall back to global setting)
+
         resolved_data_state = (data_state or DATA_STATE).lower().strip()
         if resolved_data_state not in ("all", "final"):
             return (
                 f"Invalid data_state value '{data_state}'. "
                 "Accepted values are 'all' (matches GSC dashboard) or 'final' (2-3 day lag)."
             )
-        
-        # Parse dimensions
+
         dimension_list = [d.strip() for d in dimensions.split(",")]
-        
-        # Build request
+
         request = {
             "startDate": start_date,
             "endDate": end_date,
             "dimensions": dimension_list,
-            "rowLimit": min(row_limit, 25000),  # Cap at API maximum
+            "rowLimit": min(row_limit, 25000),
             "startRow": start_row,
             "searchType": search_type.upper(),
-            "dataState": resolved_data_state
+            "dataState": resolved_data_state,
         }
-        
-        # Add sorting
-        if sort_by:
-            metric_map = {
-                "clicks": "CLICK_COUNT",
-                "impressions": "IMPRESSION_COUNT",
-                "ctr": "CTR",
-                "position": "POSITION"
-            }
-            
-            if sort_by in metric_map:
-                request["orderBy"] = [{
-                    "metric": metric_map[sort_by],
-                    "direction": sort_direction.lower()
-                }]
-        
-        # Build filter groups — multi-filter JSON takes priority over single-filter params
+
+        metric_map = {
+            "clicks": "CLICK_COUNT",
+            "impressions": "IMPRESSION_COUNT",
+            "ctr": "CTR",
+            "position": "POSITION",
+        }
+        if sort_by in metric_map:
+            request["orderBy"] = [{"metric": metric_map[sort_by], "direction": sort_direction.lower()}]
+
         active_filters = []
         if filters:
             try:
@@ -965,16 +977,15 @@ async def get_advanced_search_analytics(
             single_filter = {
                 "dimension": filter_dimension,
                 "operator": filter_operator,
-                "expression": filter_expression
+                "expression": filter_expression,
             }
             request["dimensionFilterGroups"] = [{"filters": [single_filter]}]
             active_filters = [single_filter]
-        
-        # Execute request
+
         response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
-        
+
         if not response.get("rows"):
-            no_data_msg = (
+            msg = (
                 f"No search analytics data found for {site_url} with the specified parameters.\n\n"
                 f"Parameters used:\n"
                 f"- Date range: {start_date} to {end_date}\n"
@@ -982,59 +993,54 @@ async def get_advanced_search_analytics(
                 f"- Search type: {search_type}\n"
             )
             if active_filters:
-                no_data_msg += "- Filters:\n"
+                msg += "- Filters:\n"
                 for f in active_filters:
-                    no_data_msg += f"    {f['dimension']} {f['operator']} '{f['expression']}'\n"
+                    msg += f"    {f['dimension']} {f['operator']} '{f['expression']}'\n"
             else:
-                no_data_msg += "- No filter applied\n"
-            return no_data_msg
-        
-        # Format results
-        result_lines = [f"Search analytics for {site_url}:"]
-        result_lines.append(f"Date range: {start_date} to {end_date}")
-        result_lines.append(f"Search type: {search_type}")
+                msg += "- No filter applied\n"
+            return msg
+
+        result_lines = [
+            f"Search analytics for {site_url}:",
+            f"Date range: {start_date} to {end_date}",
+            f"Search type: {search_type}",
+        ]
         if active_filters:
-            filter_desc = " AND ".join(
-                f"{f['dimension']} {f['operator']} '{f['expression']}'" for f in active_filters
+            result_lines.append(
+                "Filters: " + " AND ".join(
+                    f"{f['dimension']} {f['operator']} '{f['expression']}'" for f in active_filters
+                )
             )
-            result_lines.append(f"Filters: {filter_desc}")
-        result_lines.append(f"Showing rows {start_row+1} to {start_row+len(response.get('rows', []))} (sorted by {sort_by} {sort_direction})")
+        result_lines.append(
+            f"Showing rows {start_row + 1} to {start_row + len(response.get('rows', []))} "
+            f"(sorted by {sort_by} {sort_direction})"
+        )
         result_lines.append("\n" + "-" * 80 + "\n")
-        
-        # Create header based on dimensions
-        header = []
-        for dim in dimension_list:
-            header.append(dim.capitalize())
+
+        header = [dim.capitalize() for dim in dimension_list]
         header.extend(["Clicks", "Impressions", "CTR", "Position"])
         result_lines.append(" | ".join(header))
         result_lines.append("-" * 80)
-        
-        # Add data rows
+
         for row in response.get("rows", []):
-            data = []
-            # Add dimension values
-            for dim_value in row.get("keys", []):
-                data.append(dim_value[:100])  # Increased truncation limit to 100 characters
-            
-            # Add metrics
+            data = [dim_value[:100] for dim_value in row.get("keys", [])]
             data.append(str(row.get("clicks", 0)))
             data.append(str(row.get("impressions", 0)))
             data.append(f"{row.get('ctr', 0) * 100:.2f}%")
             data.append(f"{row.get('position', 0):.1f}")
-            
             result_lines.append(" | ".join(data))
-        
-        # Add pagination info if there might be more results
+
         if len(response.get("rows", [])) == row_limit:
             next_start = start_row + row_limit
             result_lines.append("\nThere may be more results available. To see the next page, use:")
             result_lines.append(f"start_row: {next_start}, row_limit: {row_limit}")
-        
+
         return "\n".join(result_lines)
     except Exception as e:
         if "404" in str(e):
             return _site_not_found_error(site_url)
         return f"Error retrieving advanced search analytics: {str(e)}"
+
 
 @mcp.tool()
 async def compare_search_periods(
@@ -1044,11 +1050,11 @@ async def compare_search_periods(
     period2_start: str,
     period2_end: str,
     dimensions: str = "query",
-    limit: int = 10
+    limit: int = 10,
 ) -> str:
     """
     Compare search analytics data between two time periods.
-    
+
     Args:
         site_url: Exact GSC property URL from list_properties (e.g. "https://example.com/" or
                   "sc-domain:example.com"). Domain properties cover all subdomains — use the
@@ -1062,202 +1068,143 @@ async def compare_search_periods(
     """
     try:
         service = get_gsc_service()
-        
-        # Parse dimensions
         dimension_list = [d.strip() for d in dimensions.split(",")]
-        
-        # Build requests for both periods
-        period1_request = {
-            "startDate": period1_start,
-            "endDate": period1_end,
-            "dimensions": dimension_list,
-            "rowLimit": 1000,  # Get more to ensure we can match items between periods
-            "dataState": DATA_STATE
-        }
-        
-        period2_request = {
-            "startDate": period2_start,
-            "endDate": period2_end,
-            "dimensions": dimension_list,
-            "rowLimit": 1000,
-            "dataState": DATA_STATE
-        }
-        
-        # Execute requests
-        period1_response = service.searchanalytics().query(siteUrl=site_url, body=period1_request).execute()
-        period2_response = service.searchanalytics().query(siteUrl=site_url, body=period2_request).execute()
-        
-        period1_rows = period1_response.get("rows", [])
-        period2_rows = period2_response.get("rows", [])
-        
-        if not period1_rows and not period2_rows:
+
+        def _query(start, end):
+            return service.searchanalytics().query(
+                siteUrl=site_url,
+                body={
+                    "startDate": start, "endDate": end,
+                    "dimensions": dimension_list, "rowLimit": 1000,
+                    "dataState": DATA_STATE,
+                },
+            ).execute()
+
+        p1_rows = _query(period1_start, period1_end).get("rows", [])
+        p2_rows = _query(period2_start, period2_end).get("rows", [])
+
+        if not p1_rows and not p2_rows:
             return f"No data found for either period for {site_url}."
-        
-        # Create dictionaries for easy lookup
-        period1_data = {tuple(row.get("keys", [])): row for row in period1_rows}
-        period2_data = {tuple(row.get("keys", [])): row for row in period2_rows}
-        
-        # Find common keys and calculate differences
-        all_keys = set(period1_data.keys()) | set(period2_data.keys())
+
+        p1_data = {tuple(row.get("keys", [])): row for row in p1_rows}
+        p2_data = {tuple(row.get("keys", [])): row for row in p2_rows}
+        all_keys = set(p1_data.keys()) | set(p2_data.keys())
+
         comparison_data = []
-        
         for key in all_keys:
-            p1_row = period1_data.get(key, {"clicks": 0, "impressions": 0, "ctr": 0, "position": 0})
-            p2_row = period2_data.get(key, {"clicks": 0, "impressions": 0, "ctr": 0, "position": 0})
-            
-            # Calculate differences
-            click_diff = p2_row.get("clicks", 0) - p1_row.get("clicks", 0)
-            click_pct = (click_diff / p1_row.get("clicks", 1)) * 100 if p1_row.get("clicks", 0) > 0 else float('inf')
-            
-            imp_diff = p2_row.get("impressions", 0) - p1_row.get("impressions", 0)
-            imp_pct = (imp_diff / p1_row.get("impressions", 1)) * 100 if p1_row.get("impressions", 0) > 0 else float('inf')
-            
-            ctr_diff = p2_row.get("ctr", 0) - p1_row.get("ctr", 0)
-            pos_diff = p1_row.get("position", 0) - p2_row.get("position", 0)  # Note: lower position is better
-            
+            p1 = p1_data.get(key, {"clicks": 0, "impressions": 0, "ctr": 0, "position": 0})
+            p2 = p2_data.get(key, {"clicks": 0, "impressions": 0, "ctr": 0, "position": 0})
+
+            click_diff = p2.get("clicks", 0) - p1.get("clicks", 0)
+            click_pct = (click_diff / p1.get("clicks", 1)) * 100 if p1.get("clicks", 0) > 0 else float("inf")
+            pos_diff = p1.get("position", 0) - p2.get("position", 0)
+
             comparison_data.append({
                 "key": key,
-                "p1_clicks": p1_row.get("clicks", 0),
-                "p2_clicks": p2_row.get("clicks", 0),
-                "click_diff": click_diff,
-                "click_pct": click_pct,
-                "p1_impressions": p1_row.get("impressions", 0),
-                "p2_impressions": p2_row.get("impressions", 0),
-                "imp_diff": imp_diff,
-                "imp_pct": imp_pct,
-                "p1_ctr": p1_row.get("ctr", 0),
-                "p2_ctr": p2_row.get("ctr", 0),
-                "ctr_diff": ctr_diff,
-                "p1_position": p1_row.get("position", 0),
-                "p2_position": p2_row.get("position", 0),
-                "pos_diff": pos_diff
+                "p1_clicks": p1.get("clicks", 0), "p2_clicks": p2.get("clicks", 0),
+                "click_diff": click_diff, "click_pct": click_pct,
+                "p1_position": p1.get("position", 0), "p2_position": p2.get("position", 0),
+                "pos_diff": pos_diff,
             })
-        
-        # Sort by absolute click difference (can change to other metrics)
+
         comparison_data.sort(key=lambda x: abs(x["click_diff"]), reverse=True)
-        
-        # Format results
-        result_lines = [f"Search analytics comparison for {site_url}:"]
-        result_lines.append(f"Period 1: {period1_start} to {period1_end}")
-        result_lines.append(f"Period 2: {period2_start} to {period2_end}")
-        result_lines.append(f"Dimension(s): {dimensions}")
-        result_lines.append(f"Top {min(limit, len(comparison_data))} results by change in clicks:")
-        result_lines.append("\n" + "-" * 100 + "\n")
-        
-        # Create header
-        dim_header = " | ".join([d.capitalize() for d in dimension_list])
-        result_lines.append(f"{dim_header} | P1 Clicks | P2 Clicks | Change | % | P1 Pos | P2 Pos | Pos Δ")
-        result_lines.append("-" * 100)
-        
-        # Add data rows (limited to requested number)
+
+        result_lines = [
+            f"Search analytics comparison for {site_url}:",
+            f"Period 1: {period1_start} to {period1_end}",
+            f"Period 2: {period2_start} to {period2_end}",
+            f"Dimension(s): {dimensions}",
+            f"Top {min(limit, len(comparison_data))} results by change in clicks:",
+            "\n" + "-" * 100 + "\n",
+            f"{' | '.join(d.capitalize() for d in dimension_list)} | P1 Clicks | P2 Clicks | Change | % | P1 Pos | P2 Pos | Pos Δ",
+            "-" * 100,
+        ]
+
         for item in comparison_data[:limit]:
-            key_str = " | ".join([str(k)[:100] for k in item["key"]])
-            
-            # Format the click change with color indicators
-            click_change = item["click_diff"]
-            click_pct = item["click_pct"] if item["click_pct"] != float('inf') else "N/A"
-            click_pct_str = f"{click_pct:.1f}%" if click_pct != "N/A" else "N/A"
-            
-            # Format position change (positive is good - moving up in rankings)
-            pos_change = item["pos_diff"]
-            
+            key_str = " | ".join(str(k)[:100] for k in item["key"])
+            click_pct = item["click_pct"]
+            click_pct_str = f"{click_pct:.1f}%" if click_pct != float("inf") else "N/A"
             result_lines.append(
                 f"{key_str} | {item['p1_clicks']} | {item['p2_clicks']} | "
-                f"{click_change:+d} | {click_pct_str} | "
-                f"{item['p1_position']:.1f} | {item['p2_position']:.1f} | {pos_change:+.1f}"
+                f"{item['click_diff']:+d} | {click_pct_str} | "
+                f"{item['p1_position']:.1f} | {item['p2_position']:.1f} | {item['pos_diff']:+.1f}"
             )
-        
+
         return "\n".join(result_lines)
     except Exception as e:
         if "404" in str(e):
             return _site_not_found_error(site_url)
         return f"Error comparing search periods: {str(e)}"
 
+
 @mcp.tool()
 async def get_search_by_page_query(
     site_url: str,
     page_url: str,
     days: int = 28,
-    row_limit: int = 20
+    row_limit: int = 20,
 ) -> str:
     """
     Get search analytics data for a specific page, broken down by query.
-    
+
     Args:
         site_url: Exact GSC property URL from list_properties (e.g. "https://example.com/" or
                   "sc-domain:example.com"). Domain properties cover all subdomains — use the
                   domain property as site_url and filter by page to analyze a specific subdomain.
         page_url: The specific page URL to analyze
         days: Number of days to look back (default: 28)
-        row_limit: Number of rows to return (default: 20, max: 500). Use 5-20 for quick overviews,
-                   50-200 for deeper analysis, up to 500 for comprehensive reports. For bulk exports
-                   beyond 500 rows, use get_advanced_search_analytics which supports pagination.
+        row_limit: Number of rows to return (default: 20, max: 500).
     """
     try:
         service = get_gsc_service()
-        
-        # Calculate date range
         end_date = datetime.now().date()
         start_date = end_date - timedelta(days=days)
-        
-        # Build request with page filter
+
         request = {
             "startDate": start_date.strftime("%Y-%m-%d"),
             "endDate": end_date.strftime("%Y-%m-%d"),
             "dimensions": ["query"],
-            "dimensionFilterGroups": [{
-                "filters": [{
-                    "dimension": "page",
-                    "operator": "equals",
-                    "expression": page_url
-                }]
-            }],
+            "dimensionFilterGroups": [{"filters": [{"dimension": "page", "operator": "equals", "expression": page_url}]}],
             "rowLimit": min(max(1, row_limit), 500),
             "orderBy": [{"metric": "CLICK_COUNT", "direction": "descending"}],
-            "dataState": DATA_STATE
+            "dataState": DATA_STATE,
         }
-        
-        # Execute request
+
         response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
-        
+
         if not response.get("rows"):
             return f"No search data found for page {page_url} in the last {days} days."
-        
-        # Format results
-        result_lines = [f"Search queries for page {page_url} (last {days} days):"]
-        result_lines.append("\n" + "-" * 80 + "\n")
-        
-        # Create header
-        result_lines.append("Query | Clicks | Impressions | CTR | Position")
-        result_lines.append("-" * 80)
-        
-        # Add data rows
+
+        result_lines = [f"Search queries for page {page_url} (last {days} days):",
+                        "\n" + "-" * 80 + "\n",
+                        "Query | Clicks | Impressions | CTR | Position", "-" * 80]
+
+        total_clicks = total_impressions = 0
         for row in response.get("rows", []):
             query = row.get("keys", ["Unknown"])[0]
             clicks = row.get("clicks", 0)
             impressions = row.get("impressions", 0)
-            ctr = row.get("ctr", 0) * 100
-            position = row.get("position", 0)
-            
-            result_lines.append(f"{query[:100]} | {clicks} | {impressions} | {ctr:.2f}% | {position:.1f}")
-        
-        # Add total metrics
-        total_clicks = sum(row.get("clicks", 0) for row in response.get("rows", []))
-        total_impressions = sum(row.get("impressions", 0) for row in response.get("rows", []))
+            total_clicks += clicks
+            total_impressions += impressions
+            result_lines.append(
+                f"{query[:100]} | {clicks} | {impressions} | "
+                f"{row.get('ctr', 0) * 100:.2f}% | {row.get('position', 0):.1f}"
+            )
+
         avg_ctr = (total_clicks / total_impressions * 100) if total_impressions > 0 else 0
-        
         result_lines.append("-" * 80)
         result_lines.append(f"TOTAL | {total_clicks} | {total_impressions} | {avg_ctr:.2f}% | -")
-        
+
         return "\n".join(result_lines)
     except Exception as e:
         return f"Error retrieving page query data: {str(e)}"
+
 
 @mcp.tool()
 async def list_sitemaps_enhanced(site_url: str, sitemap_index: str = None) -> str:
     """
     List all sitemaps for a specific Search Console property with detailed information.
-    
+
     Args:
         site_url: Exact GSC property URL from list_properties (e.g. "https://example.com/" or
                   "sc-domain:example.com"). Domain properties cover all subdomains — use the
@@ -1266,80 +1213,62 @@ async def list_sitemaps_enhanced(site_url: str, sitemap_index: str = None) -> st
     """
     try:
         service = get_gsc_service()
-        
-        # Get sitemaps list
+
         if sitemap_index:
             sitemaps = service.sitemaps().list(siteUrl=site_url, sitemapIndex=sitemap_index).execute()
             source = f"child sitemaps from index: {sitemap_index}"
         else:
             sitemaps = service.sitemaps().list(siteUrl=site_url).execute()
             source = "all submitted sitemaps"
-        
+
         if not sitemaps.get("sitemap"):
             return f"No sitemaps found for {site_url}" + (f" in index {sitemap_index}" if sitemap_index else ".")
-        
-        # Format the results
-        result_lines = [f"Sitemaps for {site_url} ({source}):"]
-        result_lines.append("-" * 100)
-        
-        # Header
-        result_lines.append("Path | Last Submitted | Last Downloaded | Type | URLs | Errors | Warnings")
-        result_lines.append("-" * 100)
-        
-        # Add each sitemap
+
+        result_lines = [f"Sitemaps for {site_url} ({source}):", "-" * 100,
+                        "Path | Last Submitted | Last Downloaded | Type | URLs | Errors | Warnings",
+                        "-" * 100]
+
         for sitemap in sitemaps.get("sitemap", []):
             path = sitemap.get("path", "Unknown")
-            
-            # Format dates
-            last_submitted = sitemap.get("lastSubmitted", "Never")
-            if last_submitted != "Never":
+
+            def fmt_date(val):
+                if not val or val == "Never":
+                    return "Never"
                 try:
-                    dt = datetime.fromisoformat(last_submitted.replace('Z', '+00:00'))
-                    last_submitted = dt.strftime("%Y-%m-%d %H:%M")
-                except:
-                    pass
-            
-            last_downloaded = sitemap.get("lastDownloaded", "Never")
-            if last_downloaded != "Never":
-                try:
-                    dt = datetime.fromisoformat(last_downloaded.replace('Z', '+00:00'))
-                    last_downloaded = dt.strftime("%Y-%m-%d %H:%M")
-                except:
-                    pass
-            
-            # Determine type
+                    return datetime.fromisoformat(val.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    return val
+
+            last_submitted = fmt_date(sitemap.get("lastSubmitted", "Never"))
+            last_downloaded = fmt_date(sitemap.get("lastDownloaded", "Never"))
             sitemap_type = "Index" if sitemap.get("isSitemapsIndex", False) else "Sitemap"
-            
-            # Get counts
             errors = int(sitemap.get("errors", 0))
             warnings = int(sitemap.get("warnings", 0))
 
-            # Get URL counts
             url_count = "N/A"
-            if "contents" in sitemap:
-                for content in sitemap["contents"]:
-                    if content.get("type") == "web":
-                        url_count = content.get("submitted", "0")
-                        break
-            
+            for content in sitemap.get("contents", []):
+                if content.get("type") == "web":
+                    url_count = content.get("submitted", "0")
+                    break
+
             result_lines.append(f"{path} | {last_submitted} | {last_downloaded} | {sitemap_type} | {url_count} | {errors} | {warnings}")
-        
-        # Add processing status if available
-        pending_count = sum(1 for sitemap in sitemaps.get("sitemap", []) if sitemap.get("isPending", False))
+
+        pending_count = sum(1 for s in sitemaps.get("sitemap", []) if s.get("isPending", False))
         if pending_count > 0:
             result_lines.append(f"\nNote: {pending_count} sitemaps are still pending processing by Google.")
-        
+
         return "\n".join(result_lines)
     except Exception as e:
         if "404" in str(e):
             return _site_not_found_error(site_url)
         return f"Error retrieving sitemaps: {str(e)}"
 
+
 @mcp.tool()
 async def get_sitemap_details(site_url: str, sitemap_url: str) -> str:
     """
     Get detailed information about a specific sitemap.
-    
+
     Args:
         site_url: Exact GSC property URL from list_properties (e.g. "https://example.com/" or
                   "sc-domain:example.com"). Domain properties cover all subdomains — use the
@@ -1348,68 +1277,49 @@ async def get_sitemap_details(site_url: str, sitemap_url: str) -> str:
     """
     try:
         service = get_gsc_service()
-        
-        # Get sitemap details
         details = service.sitemaps().get(siteUrl=site_url, feedpath=sitemap_url).execute()
-        
+
         if not details:
             return f"No details found for sitemap {sitemap_url}."
-        
-        # Format the results
-        result_lines = [f"Sitemap Details for {sitemap_url}:"]
-        result_lines.append("-" * 80)
-        
-        # Basic info
+
+        result_lines = [f"Sitemap Details for {sitemap_url}:", "-" * 80]
         is_index = details.get("isSitemapsIndex", False)
         result_lines.append(f"Type: {'Sitemap Index' if is_index else 'Sitemap'}")
-        
-        # Status
-        is_pending = details.get("isPending", False)
-        result_lines.append(f"Status: {'Pending processing' if is_pending else 'Processed'}")
-        
-        # Dates
-        if "lastSubmitted" in details:
-            try:
-                dt = datetime.fromisoformat(details["lastSubmitted"].replace('Z', '+00:00'))
-                result_lines.append(f"Last Submitted: {dt.strftime('%Y-%m-%d %H:%M')}")
-            except:
-                result_lines.append(f"Last Submitted: {details['lastSubmitted']}")
-        
-        if "lastDownloaded" in details:
-            try:
-                dt = datetime.fromisoformat(details["lastDownloaded"].replace('Z', '+00:00'))
-                result_lines.append(f"Last Downloaded: {dt.strftime('%Y-%m-%d %H:%M')}")
-            except:
-                result_lines.append(f"Last Downloaded: {details['lastDownloaded']}")
-        
-        # Errors and warnings
+        result_lines.append(f"Status: {'Pending processing' if details.get('isPending', False) else 'Processed'}")
+
+        for field, label in [("lastSubmitted", "Last Submitted"), ("lastDownloaded", "Last Downloaded")]:
+            if field in details:
+                try:
+                    dt = datetime.fromisoformat(details[field].replace("Z", "+00:00"))
+                    result_lines.append(f"{label}: {dt.strftime('%Y-%m-%d %H:%M')}")
+                except Exception:
+                    result_lines.append(f"{label}: {details[field]}")
+
         result_lines.append(f"Errors: {details.get('errors', 0)}")
         result_lines.append(f"Warnings: {details.get('warnings', 0)}")
-        
-        # Content breakdown
-        if "contents" in details and details["contents"]:
+
+        if details.get("contents"):
             result_lines.append("\nContent Breakdown:")
             for content in details["contents"]:
-                content_type = content.get("type", "Unknown").upper()
-                submitted = content.get("submitted", 0)
-                indexed = content.get("indexed", "N/A")
-                
-                result_lines.append(f"- {content_type}: {submitted} submitted, {indexed} indexed")
-        
-        # If it's an index, suggest how to list child sitemaps
+                result_lines.append(
+                    f"- {content.get('type', 'Unknown').upper()}: "
+                    f"{content.get('submitted', 0)} submitted, {content.get('indexed', 'N/A')} indexed"
+                )
+
         if is_index:
-            result_lines.append("\nThis is a sitemap index. To list child sitemaps, use:")
+            result_lines.append(f"\nThis is a sitemap index. To list child sitemaps, use:")
             result_lines.append(f"list_sitemaps_enhanced with sitemap_index={sitemap_url}")
-        
+
         return "\n".join(result_lines)
     except Exception as e:
         return f"Error retrieving sitemap details: {str(e)}"
+
 
 @mcp.tool()
 async def submit_sitemap(site_url: str, sitemap_url: str) -> str:
     """
     Submit a new sitemap or resubmit an existing one to Google.
-    
+
     Args:
         site_url: Exact GSC property URL from list_properties (e.g. "https://example.com/" or
                   "sc-domain:example.com"). Domain properties cover all subdomains — use the
@@ -1418,45 +1328,33 @@ async def submit_sitemap(site_url: str, sitemap_url: str) -> str:
     """
     try:
         service = get_gsc_service()
-        
-        # Submit the sitemap
         service.sitemaps().submit(siteUrl=site_url, feedpath=sitemap_url).execute()
-        
-        # Verify submission by getting details
+
         try:
             details = service.sitemaps().get(siteUrl=site_url, feedpath=sitemap_url).execute()
-            
-            # Format response
             result_lines = [f"Successfully submitted sitemap: {sitemap_url}"]
-            
-            # Add submission time if available
             if "lastSubmitted" in details:
                 try:
-                    dt = datetime.fromisoformat(details["lastSubmitted"].replace('Z', '+00:00'))
+                    dt = datetime.fromisoformat(details["lastSubmitted"].replace("Z", "+00:00"))
                     result_lines.append(f"Submission time: {dt.strftime('%Y-%m-%d %H:%M')}")
-                except:
+                except Exception:
                     result_lines.append(f"Submission time: {details['lastSubmitted']}")
-            
-            # Add processing status
-            is_pending = details.get("isPending", True)
-            result_lines.append(f"Status: {'Pending processing' if is_pending else 'Processing started'}")
-            
-            # Add note about processing time
+            result_lines.append(
+                f"Status: {'Pending processing' if details.get('isPending', True) else 'Processing started'}"
+            )
             result_lines.append("\nNote: Google may take some time to process the sitemap. Check back later for full details.")
-            
             return "\n".join(result_lines)
-        except:
-            # If we can't get details, just return basic success message
+        except Exception:
             return f"Successfully submitted sitemap: {sitemap_url}\n\nGoogle will queue it for processing."
-    
     except Exception as e:
         return f"Error submitting sitemap: {str(e)}"
+
 
 @mcp.tool()
 async def manage_sitemaps(site_url: str, action: str, sitemap_url: str = None, sitemap_index: str = None) -> str:
     """
-    All-in-one tool to manage sitemaps (list, get details, submit, delete).
-    
+    All-in-one tool to manage sitemaps (list, get details, submit).
+
     Args:
         site_url: Exact GSC property URL from list_properties (e.g. "https://example.com/" or
                   "sc-domain:example.com"). Domain properties cover all subdomains — use the
@@ -1466,7 +1364,6 @@ async def manage_sitemaps(site_url: str, action: str, sitemap_url: str = None, s
         sitemap_index: Optional sitemap index URL for listing child sitemaps (only used with 'list' action)
     """
     try:
-        # Validate inputs
         action = action.lower().strip()
         valid_actions = ["list", "details", "submit"]
 
@@ -1476,23 +1373,22 @@ async def manage_sitemaps(site_url: str, action: str, sitemap_url: str = None, s
         if action in ["details", "submit"] and not sitemap_url:
             return f"The {action} action requires a sitemap_url parameter."
 
-        # Perform the requested action
         if action == "list":
             return await list_sitemaps_enhanced(site_url, sitemap_index)
         elif action == "details":
             return await get_sitemap_details(site_url, sitemap_url)
         elif action == "submit":
             return await submit_sitemap(site_url, sitemap_url)
-    
     except Exception as e:
         return f"Error managing sitemaps: {str(e)}"
+
 
 @mcp.tool()
 async def get_creator_info() -> str:
     """
     Provides information about Amin Foroutan, the creator of the MCP-GSC tool.
     """
-    creator_info = """
+    return """
 # About the Creator: Amin Foroutan
 
 Amin Foroutan is an SEO consultant with over a decade of experience, specializing in technical SEO, Python-driven tools, and data analysis for SEO performance.
@@ -1513,54 +1409,376 @@ Amin has created several popular SEO tools including:
 - Google AI Overview Citation Analysis (900+ users)
 - SEMRush Enhancer (570+ users)
 - SEO Page Inspector (115+ users)
-
-## Expertise:
-
-Amin combines technical SEO knowledge with programming skills to create innovative solutions for SEO challenges.
 """
-    return creator_info
+
 
 @mcp.tool()
 async def reauthenticate() -> str:
     """
-    Perform a logout and new login sequence.
-    Deletes the current OAuth token file and triggers the browser authentication flow.
-    Useful when you need to switch to a different Google account.
+    Clear your current Google authorization and get a link to re-authorize.
+    Use this if the wrong Google account was authorized, or you want to switch accounts.
     """
+    if MCP_TRANSPORT == "stdio":
+        # Local/stdio mode: delete token and run local OAuth flow
+        try:
+            if os.path.exists(TOKEN_FILE):
+                os.remove(TOKEN_FILE)
+                token_deleted = True
+            else:
+                token_deleted = False
+
+            if not OAUTH_CLIENT_ID or not OAUTH_CLIENT_SECRET:
+                return (
+                    "Error: GSC_OAUTH_CLIENT_ID and GSC_OAUTH_CLIENT_SECRET must be set in .env. "
+                    "Cannot start new authentication flow."
+                )
+
+            flow = InstalledAppFlow.from_client_config(_build_installed_client_config(), SCOPES)
+            creds = flow.run_local_server(port=8080)
+            with open(TOKEN_FILE, "w") as token:
+                token.write(creds.to_json())
+
+            msg = "Successfully authenticated with a new Google account."
+            if token_deleted:
+                msg = "Previous session deleted. " + msg
+            return msg
+        except Exception as e:
+            return f"Error during reauthentication: {str(e)}"
+    else:
+        # SSE/multi-tenant mode: delete the user's token and return a setup URL
+        user_key = current_user_key.get()
+        if not user_key:
+            return "Error: No API key found in this connection."
+
+        token_file = _token_file(user_key)
+        if os.path.exists(token_file):
+            os.remove(token_file)
+
+        return (
+            "Your Google authorization has been cleared.\n\n"
+            "To re-authorize with the correct account:\n\n"
+            f"  1. Switch to the correct Google account in your browser\n"
+            f"  2. Visit: {SERVER_URL}/setup?key={user_key}\n\n"
+            "After completing authorization, come back here and try list_properties to confirm."
+        )
+
+
+# ─── Web endpoints ─────────────────────────────────────────────────────────────
+
+_SETUP_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>GSC MCP — Connect Your Google Account</title>
+  <style>
+    body {{ font-family: system-ui, sans-serif; max-width: 640px; margin: 60px auto; padding: 0 24px; color: #222; }}
+    h1 {{ font-size: 1.6rem; margin-bottom: 0.25rem; }}
+    .sub {{ color: #666; margin-bottom: 2rem; }}
+    .btn {{ display: inline-block; background: #4285F4; color: #fff; padding: 12px 28px;
+            border-radius: 6px; text-decoration: none; font-weight: 600; margin-top: 1rem; }}
+    .btn:hover {{ background: #3367D6; }}
+    .warning {{ background: #fff8e1; border-left: 4px solid #f9a825; padding: 12px 16px;
+                border-radius: 4px; margin: 1.5rem 0; font-size: 0.92rem; }}
+    .key {{ font-family: monospace; background: #f5f5f5; padding: 2px 6px; border-radius: 3px; }}
+  </style>
+</head>
+<body>
+  <h1>Connect Your Google Search Console</h1>
+  <p class="sub">This will authorize read-only access to your GSC properties.</p>
+
+  <div class="warning">
+    <strong>Before clicking below:</strong> Make sure you are signed into the <em>correct</em>
+    Google account in this browser. The account that approves the next screen is the one
+    that will be authorized.
+  </div>
+
+  <p>Your API key: <span class="key">{user_key}</span></p>
+  <p>Save this key — you will need it to configure Claude Desktop.</p>
+
+  <a class="btn" href="{auth_url}">Authorize with Google &rarr;</a>
+</body>
+</html>"""
+
+_SUCCESS_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>GSC MCP — Authorization Complete</title>
+  <style>
+    body {{ font-family: system-ui, sans-serif; max-width: 760px; margin: 60px auto; padding: 0 24px; color: #222; line-height: 1.6; }}
+    h1 {{ color: #2e7d32; margin-bottom: 0.25rem; }}
+    h2 {{ margin-top: 2rem; border-bottom: 1px solid #e0e0e0; padding-bottom: 4px; }}
+    pre {{ background: #f5f5f5; padding: 16px; border-radius: 6px; overflow-x: auto; font-size: 0.85rem; white-space: pre-wrap; word-break: break-all; }}
+    .key-box {{ font-family: monospace; background: #e8f5e9; border: 1px solid #a5d6a7;
+                padding: 12px 16px; border-radius: 6px; font-size: 1.05rem; display: block;
+                margin: 1rem 0; word-break: break-all; }}
+    .warn {{ background: #fff3e0; border-left: 4px solid #ff9800; padding: 12px 16px; border-radius: 4px; margin: 1rem 0; }}
+    .info {{ background: #e3f2fd; border-left: 4px solid #1976d2; padding: 12px 16px; border-radius: 4px; margin: 1rem 0; }}
+    .step {{ background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 16px; margin: 12px 0; }}
+    .step-num {{ display: inline-block; background: #1976d2; color: #fff; border-radius: 50%;
+                 width: 24px; height: 24px; text-align: center; line-height: 24px; font-size: 0.85rem;
+                 font-weight: bold; margin-right: 8px; }}
+    code {{ background: #f0f0f0; padding: 2px 5px; border-radius: 3px; font-size: 0.9em; }}
+    .path {{ font-family: monospace; font-size: 0.88rem; color: #555; }}
+  </style>
+</head>
+<body>
+  <h1>&#10003; Authorization Successful!</h1>
+  <p>Your Google account has been connected to the GSC MCP server.</p>
+
+  <h2>Your API Key</h2>
+  <p>This key identifies you on the server. Keep it safe — anyone with it can read your GSC data.</p>
+  <span class="key-box">{user_key}</span>
+  <div class="warn"><strong>Save this key now.</strong> If you lose it, visit <code>/setup</code> again to generate a new one.</div>
+
+  <h2>Step 1 — Find your Claude Desktop config file</h2>
+
+  <div class="step">
+    <span class="step-num">A</span> <strong>Windows (standard installer)</strong><br>
+    <span class="path">%APPDATA%\\Claude\\claude_desktop_config.json</span><br>
+    <small>Usually: <code>C:\\Users\\YourName\\AppData\\Roaming\\Claude\\claude_desktop_config.json</code></small>
+  </div>
+
+  <div class="step">
+    <span class="step-num">B</span> <strong>Windows (Microsoft Store version)</strong><br>
+    <span class="path">%LOCALAPPDATA%\\Packages\\Claude_&lt;id&gt;\\LocalCache\\Roaming\\Claude\\claude_desktop_config.json</span>
+  </div>
+
+  <div class="step">
+    <span class="step-num">C</span> <strong>macOS</strong><br>
+    <span class="path">~/Library/Application Support/Claude/claude_desktop_config.json</span>
+  </div>
+
+  <h2>Step 2 — Add the GSC server to your config</h2>
+
+  <p>Open the file above and merge the <code>"gsc"</code> entry into the <code>"mcpServers"</code> object.
+  Choose the option that matches your Claude Desktop version.</p>
+
+  <h3 style="margin-top:1.5rem">&#9654; Option A — Modern Claude Desktop (recommended)</h3>
+  <p>Supported in Claude Desktop v0.7 and newer. Uses a direct URL connection.</p>
+  <p><strong>Full config (paste if file is empty or missing):</strong></p>
+  <pre>{full_config}</pre>
+  <p><strong>Just the <code>"gsc"</code> block (add inside your existing <code>"mcpServers"</code>):</strong></p>
+  <pre>{gsc_block}</pre>
+
+  <h3 style="margin-top:1.5rem">&#9654; Option B — Legacy Claude Desktop</h3>
+  <p>Use this if Option A gives a <em>"command is required"</em> error. Requires <strong>Node.js</strong> installed on your machine — <a href="https://nodejs.org" target="_blank">download here</a> if you don't have it.</p>
+  <p><strong>Full config (paste if file is empty or missing):</strong></p>
+  <pre>{legacy_full_config}</pre>
+  <p><strong>Just the <code>"gsc"</code> block (add inside your existing <code>"mcpServers"</code>):</strong></p>
+  <pre>{legacy_gsc_block}</pre>
+
+  <div class="info">
+    Option B uses <code>mcp-remote</code>, a small bridge that runs locally and forwards your
+    requests to this server. Your API key is embedded in the URL so the server knows whose
+    GSC account to use.
+  </div>
+
+  <h2>Step 3 — Restart Claude Desktop</h2>
+  <ol>
+    <li>Fully quit Claude Desktop — right-click the system tray icon → Quit,<br>
+        <em>or</em> open Task Manager → find Claude.exe → End Task</li>
+    <li>Reopen Claude Desktop</li>
+    <li>Open a new chat and type: <code>list_properties</code></li>
+    <li>You should see your GSC properties listed ✓</li>
+  </ol>
+
+  <h2>Wrong Google account?</h2>
+  <p>Type <code>reauthenticate</code> in a Claude Desktop chat. The server will clear your token
+  and give you a link to sign in with the correct account.</p>
+</body>
+</html>"""
+
+
+async def handle_setup(request: Request) -> Response:
+    """Initiate the OAuth flow for a user."""
+    if not OAUTH_CLIENT_ID or not OAUTH_CLIENT_SECRET:
+        logger.error("Setup requested but GSC_OAUTH_CLIENT_ID / GSC_OAUTH_CLIENT_SECRET not set in .env")
+        return HTMLResponse(
+            "<h1>Server not configured</h1>"
+            "<p><code>GSC_OAUTH_CLIENT_ID</code> and <code>GSC_OAUTH_CLIENT_SECRET</code> "
+            "must be set in the server's <code>.env</code> file.</p>",
+            status_code=500,
+        )
+
+    user_key = request.query_params.get("key") or secrets.token_urlsafe(32)
+    logger.info("OAuth setup initiated for key ...%s (ip=%s)", user_key[-6:], request.client.host if request.client else "unknown")
+
+    flow = Flow.from_client_config(
+        _build_web_client_config(),
+        scopes=SCOPES,
+        redirect_uri=REDIRECT_URI,
+    )
+    auth_url, state = flow.authorization_url(
+        access_type="offline",
+        prompt="consent",
+        include_granted_scopes="true",
+    )
+
+    # Persist state → user_key + code_verifier so callback can complete PKCE exchange
+    states = _load_states()
+    now = datetime.utcnow().timestamp()
+    # Prune expired states while we're here
+    states = {k: v for k, v in states.items() if now - v.get("ts", 0) < _STATE_TTL_SECONDS}
+    states[state] = {
+        "user_key": user_key,
+        "ts": now,
+        "code_verifier": getattr(flow, "code_verifier", None),
+    }
+    _save_states(states)
+
+    return HTMLResponse(_SETUP_PAGE.format(user_key=user_key, auth_url=auth_url))
+
+
+async def handle_oauth_callback(request: Request) -> Response:
+    """Handle the OAuth redirect from Google."""
+    error = request.query_params.get("error")
+    if error:
+        logger.warning("OAuth callback returned error: %s", error)
+        return HTMLResponse(
+            f"<h1>Authorization failed</h1><p>Google returned: <code>{error}</code></p>"
+            f"<p><a href='/setup'>Try again</a></p>",
+            status_code=400,
+        )
+
+    state = request.query_params.get("state")
+    code = request.query_params.get("code")
+
+    state_entry = _consume_oauth_state(state)
+    if not state_entry:
+        logger.warning("OAuth callback received invalid or expired state token")
+        return HTMLResponse(
+            "<h1>Invalid or expired session</h1>"
+            "<p>The authorization link has expired (10 minute limit). "
+            "<a href='/setup'>Please start again</a>.</p>",
+            status_code=400,
+        )
+
+    user_key = state_entry["user_key"]
+    code_verifier = state_entry.get("code_verifier")
+
     try:
-        # Delete existing token to force re-authentication
-        if os.path.exists(TOKEN_FILE):
-            os.remove(TOKEN_FILE)
-            token_deleted = True
-        else:
-            token_deleted = False
+        flow = Flow.from_client_config(
+            _build_web_client_config(),
+            scopes=SCOPES,
+            redirect_uri=REDIRECT_URI,
+            state=state,
+        )
+        if code_verifier:
+            flow.code_verifier = code_verifier
+        flow.fetch_token(code=code)
+        creds = flow.credentials
 
-        # Check if OAuth client secrets file exists
-        if not os.path.exists(OAUTH_CLIENT_SECRETS_FILE):
-            return (
-                "Error: OAuth client secrets file not found. "
-                "Cannot start new authentication flow. "
-                "Please ensure client_secrets.json is present or set the "
-                "GSC_OAUTH_CLIENT_SECRETS_FILE environment variable."
-            )
-
-        # Trigger new OAuth flow — this opens a browser window on the local machine
-        flow = InstalledAppFlow.from_client_secrets_file(OAUTH_CLIENT_SECRETS_FILE, SCOPES)
-        creds = flow.run_local_server(port=8080)
-
-        # Save the new credentials for future use
-        with open(TOKEN_FILE, "w") as token:
-            token.write(creds.to_json())
-
-        msg = "Successfully authenticated with a new Google account."
-        if token_deleted:
-            msg = "Previous session deleted. " + msg
-        return msg
-
+        token_file = _token_file(user_key)
+        with open(token_file, "w") as f:
+            f.write(creds.to_json())
+        logger.info("OAuth complete — token saved for key ...%s", user_key[-6:])
     except Exception as e:
-        return f"Error during reauthentication: {str(e)}"
+        logger.error("Token exchange failed for key ...%s: %s", user_key[-6:], e)
+        return HTMLResponse(
+            f"<h1>Token exchange failed</h1><p>{str(e)}</p>"
+            f"<p><a href='/setup?key={user_key}'>Try again</a></p>",
+            status_code=500,
+        )
 
+    sse_url = f"{SERVER_URL}/sse?key={user_key}"
+
+    # Modern Claude Desktop config (url format)
+    full_config = json.dumps({"mcpServers": {"gsc": {"url": sse_url}}}, indent=2)
+    gsc_block = json.dumps({"gsc": {"url": sse_url}}, indent=2)
+
+    # Legacy Claude Desktop config (mcp-remote bridge via npx)
+    legacy_entry = {"command": "npx", "args": ["-y", "mcp-remote", sse_url]}
+    legacy_full_config = json.dumps({"mcpServers": {"gsc": legacy_entry}}, indent=2)
+    legacy_gsc_block = json.dumps({"gsc": legacy_entry}, indent=2)
+
+    return HTMLResponse(_SUCCESS_PAGE.format(
+        user_key=user_key,
+        full_config=full_config,
+        gsc_block=gsc_block,
+        legacy_full_config=legacy_full_config,
+        legacy_gsc_block=legacy_gsc_block,
+    ))
+
+
+async def handle_health(request: Request) -> Response:
+    return JSONResponse({"status": "ok", "transport": MCP_TRANSPORT})
+
+
+# ─── Middleware ────────────────────────────────────────────────────────────────
+
+class UserKeyMiddleware(BaseHTTPMiddleware):
+    """Extract ?key= from the SSE connection URL and set it in the context var."""
+
+    async def dispatch(self, request: Request, call_next):
+        key = request.query_params.get("key") or request.headers.get("x-api-key")
+        path = request.url.path
+        if key:
+            sanitized = _sanitize_key(key)
+            logger.info("Request  %s %s  key=...%s", request.method, path, sanitized[-6:])
+            token = current_user_key.set(sanitized)
+            try:
+                response = await call_next(request)
+            finally:
+                current_user_key.reset(token)
+        else:
+            if path not in ("/health",):
+                logger.info("Request  %s %s  (no key)", request.method, path)
+            response = await call_next(request)
+        return response
+
+
+# ─── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Start the MCP server on stdio transport
-    mcp.run(transport="stdio")
+    if MCP_TRANSPORT == "stdio":
+        # Local mode — original behaviour
+        mcp.run(transport="stdio")
+    else:
+        # SSE/HTTP mode for VPS hosting
+        sse_transport = SseServerTransport("/messages/")
+
+        async def handle_sse(request: Request) -> Response:
+            user_key = current_user_key.get() or "unknown"
+            logger.info("SSE connection opened  key=...%s", user_key[-6:])
+            try:
+                async with sse_transport.connect_sse(
+                    request.scope, request.receive, request._send
+                ) as streams:
+                    await mcp._mcp_server.run(
+                        streams[0],
+                        streams[1],
+                        mcp._mcp_server.create_initialization_options(),
+                    )
+            finally:
+                logger.info("SSE connection closed  key=...%s", user_key[-6:])
+            return Response()
+
+        app = Starlette(
+            routes=[
+                Route("/health", endpoint=handle_health),
+                Route("/setup", endpoint=handle_setup),
+                Route("/oauth/callback", endpoint=handle_oauth_callback),
+                Route("/sse", endpoint=handle_sse),
+                Mount("/messages/", app=sse_transport.handle_post_message),
+            ]
+        )
+        app.add_middleware(UserKeyMiddleware)
+
+        logger.info("=" * 60)
+        logger.info("GSC MCP Server starting")
+        logger.info("  Transport : SSE (HTTP)")
+        logger.info("  Port      : %s", PORT)
+        logger.info("  Public URL: %s", SERVER_URL)
+        logger.info("  Setup page: %s/setup", SERVER_URL)
+        logger.info("  Health    : %s/health", SERVER_URL)
+        logger.info("  Data dir  : %s", DATA_DIR)
+        logger.info("=" * 60)
+
+        uvicorn.run(
+            app,
+            host="0.0.0.0",
+            port=PORT,
+            log_level="info",
+            access_log=True,
+        )

@@ -1,0 +1,11 @@
+.venv
+__pycache__
+*.pyc
+*.pyo
+data/
+token.json
+service_account_credentials.json
+oauth_states.json
+.git
+.env
+.env.example

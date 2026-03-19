@@ -6,7 +6,8 @@
       "Bash(powershell.exe -Command \"echo \\\\$env:APPDATA\")",
       "Bash(.venv/Scripts/python.exe gsc_server.py)",
       "Bash(echo \"EXIT=$?\")",
-      "Bash(powershell.exe -Command \"& 'D:\\\\Botpresso\\\\Nitin-classed\\\\mcp-gsc\\\\.venv\\\\Scripts\\\\python.exe' -c \\\\\"import mcp; import google.auth; import googleapiclient; print\\('OK'\\)\\\\\"\")"
+      "Bash(powershell.exe -Command \"& 'D:\\\\Botpresso\\\\Nitin-classed\\\\mcp-gsc\\\\.venv\\\\Scripts\\\\python.exe' -c \\\\\"import mcp; import google.auth; import googleapiclient; print\\('OK'\\)\\\\\"\")",
+      "Bash(\"D:\\\\Botpresso\\\\Nitin-classed\\\\mcp-gsc\\\\data\\\\.gitkeep\")"
     ]
   }
 }

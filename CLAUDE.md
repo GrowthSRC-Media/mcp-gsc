@@ -20,7 +20,7 @@ When the user says anything like "run the server", "set up the server", "start t
 Check that the following exist in cwd:
 - Python entrypoint (e.g. `gsc_server.py`)
 - `requirements.txt`
-- Read the server source to find the OAuth callback port/path
+- `.env` file
 
 Tell the user what you found.
 
@@ -89,30 +89,36 @@ Print this block verbatim and wait for the user to reply "done":
    ── Part D: Create the OAuth 2.0 client ─────────────
    15. Go to: APIs & Services → Credentials
    16. Click "+ CREATE CREDENTIALS" → "OAuth 2.0 Client ID"
-   17. Application type: Desktop app
-   18. Name: anything (e.g. "GSC MCP Desktop") → click CREATE
-   19. In the dialog that appears, click "DOWNLOAD JSON"
-       NOTE: Google will download it with a long name like:
-       client_secret_123456789-abc123.apps.googleusercontent.com.json
-       You need to rename it.
-   20. Rename the file to exactly: client_secrets.json
-       (add the "s" — the server looks for this exact name)
-   21. Move it into this project folder (replace any existing file)
+   17. Application type:
+       - If hosting on a VPS → choose "Web application"
+         Under "Authorized redirect URIs" add: {SERVER_URL}/oauth/callback
+         (e.g. https://mcp.yourdomain.com/oauth/callback)
+       - If running locally (stdio mode) → choose "Desktop app"
+   18. Name: anything (e.g. "GSC MCP") → click CREATE
+   19. In the dialog that appears, you will see your Client ID and Client Secret.
+       Copy both values — you will paste them into the .env file next.
+       (Do NOT download the JSON file — it is not needed)
 
    Reply "done" when finished.
    ─────────────────────────────────────────────────────
 
 ---
 
-## STEP 4 — Verify client_secrets.json
+## STEP 4 — Write Client ID and Secret into .env
 
-After the user replies "done", do NOT trust it — check yourself:
+After the user replies "done":
 
-1. List the files in cwd and look for `client_secrets.json`.
-2. If you only see a file like `client_secret_*.json` (without the "s"), tell the user:
-   "The file was downloaded but not renamed. Please rename it from `client_secret_*.json` to `client_secrets.json` and move it to this folder."
-   Then wait for another "done" and re-check.
-3. Once `client_secrets.json` exists, read it and confirm it contains a valid `client_id`.
+1. Read the `.env` file.
+2. Ask the user to provide their Client ID and Client Secret if they haven't already.
+3. Write the values into `.env`:
+   ```
+   GSC_OAUTH_CLIENT_ID=<client_id_from_google>
+   GSC_OAUTH_CLIENT_SECRET=<client_secret_from_google>
+   ```
+4. Confirm the values are written by reading the file back.
+
+Do NOT accept placeholder text — the values must look like real credentials
+(Client ID ends in `.apps.googleusercontent.com`, Client Secret starts with `GOCSPX-` or similar).
 
 ---
 
@@ -187,7 +193,7 @@ Tell the user:
    OR open Task Manager → find Claude.exe → End Task
 2. Reopen Claude Desktop
 3. A browser tab will open asking to authorize Google Search Console — approve it with the correct account
-4. In Claude Desktop, open a new chat and type: `list_sites`
+4. In Claude Desktop, open a new chat and type: `list_properties`
    - If you see your GSC properties listed → setup is complete
    - If Claude Desktop says "server not running" → the dependencies may not have installed correctly. Go back to Step 2 and re-run the pip install.
 
@@ -195,9 +201,9 @@ Tell the user:
 
 ## STEP 9 — Reauthentication (wrong account or need to switch accounts)
 
-**When to do this:** Any time the wrong Google account was authorized, `list_sites` returns sites you don't recognize, or you want to switch to a different Google account.
+**When to do this:** Any time the wrong Google account was authorized, `list_properties` returns sites you don't recognize, or you want to switch to a different Google account.
 
-**How it works:** The server stores the authorized token in `token.json` in the project folder. The `reauthenticate` tool deletes that file and triggers a fresh OAuth flow so you can sign in with the correct account.
+**How it works:** The server stores the authorized token in the `data/tokens/` folder. The `reauthenticate` tool deletes that token and triggers a fresh OAuth flow so you can sign in with the correct account.
 
 **To reauthenticate:**
 
@@ -214,7 +220,7 @@ Print this block verbatim:
 
    3. A browser popup will appear — approve it with the correct account.
 
-   4. Once done, type `list_sites` to confirm the right properties appear.
+   4. Once done, type `list_properties` to confirm the right properties appear.
 
    You can reauthenticate as many times as needed — it will not break
    anything or affect your GSC data.
@@ -232,6 +238,7 @@ Print this block verbatim:
 - Do not ask the user to activate `.venv` — always reference `.venv\Scripts\python` and `.venv\Scripts\pip` directly.
 - For terminal commands Claude can run itself (e.g. venv creation, pip install, import checks), always run them directly using the Bash tool — do NOT ask the user to paste them.
 - Only ask the user to run commands manually when it requires their credentials, browser interaction, or GUI actions that Claude cannot automate.
+- No JSON credential files are used. Client ID and Client Secret are read from `.env` only.
 - Do not run the MCP server manually for testing. It is a stdio server launched by Claude Desktop automatically. Running it directly in a terminal will show JSON parse errors — this is expected and not a bug. "Server not running" in Claude Desktop means dependencies are missing, not that you need to run it manually.
 - Windows only — use PowerShell/Windows syntax. Never use Unix syntax.
 - Always verify results yourself after each step — do not trust "done" without checking.
@@ -242,9 +249,9 @@ Print this block verbatim:
 ## Expected output at end of session
 
 - Confirmation that `.venv` exists and imports verified (`mcp`, `google.auth`, `googleapiclient`)
-- Confirmation that `client_secrets.json` is present with a valid `client_id`
+- Confirmation that `GSC_OAUTH_CLIENT_ID` and `GSC_OAUTH_CLIENT_SECRET` are set in `.env` with real values
 - The exact JSON written to `claude_desktop_config.json`
 - The full path of the config file that was actually used
 - Reminder to switch browser to the correct Google account BEFORE restarting Claude Desktop
-- Reminder to restart Claude Desktop and test with `list_sites`
+- Reminder to restart Claude Desktop and test with `list_properties`
 - Reminder that if the wrong account gets authorized, the user can say "reauthenticate" in Claude Desktop to fix it at any time

@@ -1,0 +1,14 @@
+services:
+  gsc-mcp:
+    build: .
+    # Port is read from .env — ${PORT} expands automatically
+    ports:
+      - "${PORT}:${PORT}"
+    volumes:
+      # Mount .env so the Python process can read it inside the container
+      - ./.env:/app/.env:ro
+      # Mount data directory for tokens and client_secrets.json
+      - ./data:/data
+    env_file:
+      - .env
+    restart: unless-stopped
