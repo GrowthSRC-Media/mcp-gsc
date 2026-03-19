@@ -56,7 +56,7 @@ if _raw_data_state not in ("all", "final"):
     )
 DATA_STATE = _raw_data_state
 
-SCOPES = ["https://www.googleapis.com/auth/webmasters"]
+SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"]
 
 def get_gsc_service():
     """
@@ -263,55 +263,6 @@ async def add_site(site_url: str) -> str:
             return f"Error adding site (HTTP {error_code}): {error_message}"
     except Exception as e:
         return f"Error adding site: {str(e)}"
-
-@mcp.tool()
-async def delete_site(site_url: str) -> str:
-    """
-    Remove a site from your Search Console properties.
-    
-    Args:
-        site_url: The URL of the site to remove (must be exact match e.g. https://example.com, or https://www.example.com, or https://subdomain.example.com/path/, for domain properties use format: sc-domain:example.com)
-    """
-    try:
-        service = get_gsc_service()
-        
-        # Delete the site
-        service.sites().delete(siteUrl=site_url).execute()
-        
-        return f"Site {site_url} has been removed from Search Console."
-    except HttpError as e:
-        error_content = json.loads(e.content.decode('utf-8'))
-        error_details = error_content.get('error', {})
-        error_code = e.resp.status
-        error_message = error_details.get('message', str(e))
-        error_reason = error_details.get('errors', [{}])[0].get('reason', '')
-        
-        if error_code == 404:
-            return f"Site {site_url} was not found in Search Console."
-        elif error_code == 403:
-            if error_reason == 'forbidden':
-                return f"Error: You don't have permission to remove this site."
-            elif error_reason == 'quotaExceeded':
-                return f"Error: API quota exceeded. Please try again later."
-            else:
-                return f"Error: Permission denied. {error_message}"
-        elif error_code == 400:
-            if error_reason == 'invalidParameter':
-                return f"Error: Invalid site URL format. Please check the URL format and try again."
-            else:
-                return f"Error: Bad request. {error_message}"
-        elif error_code == 401:
-            return f"Error: Unauthorized. Please check your credentials."
-        elif error_code == 429:
-            return f"Error: Too many requests. Please try again later."
-        elif error_code == 500:
-            return f"Error: Internal server error from Google Search Console API. Please try again later."
-        elif error_code == 503:
-            return f"Error: Service unavailable. Google Search Console API is currently down. Please try again later."
-        else:
-            return f"Error removing site (HTTP {error_code}): {error_message}"
-    except Exception as e:
-        return f"Error removing site: {str(e)}"
 
 @mcp.tool()
 async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = "query", row_limit: int = 20) -> str:
@@ -1502,37 +1453,6 @@ async def submit_sitemap(site_url: str, sitemap_url: str) -> str:
         return f"Error submitting sitemap: {str(e)}"
 
 @mcp.tool()
-async def delete_sitemap(site_url: str, sitemap_url: str) -> str:
-    """
-    Delete (unsubmit) a sitemap from Google Search Console.
-    
-    Args:
-        site_url: Exact GSC property URL from list_properties (e.g. "https://example.com/" or
-                  "sc-domain:example.com"). Domain properties cover all subdomains — use the
-                  domain property as site_url and filter by page to analyze a specific subdomain.
-        sitemap_url: The full URL of the sitemap to delete
-    """
-    try:
-        service = get_gsc_service()
-        
-        # First check if the sitemap exists
-        try:
-            service.sitemaps().get(siteUrl=site_url, feedpath=sitemap_url).execute()
-        except Exception as e:
-            if "404" in str(e):
-                return f"Sitemap not found: {sitemap_url}. It may have already been deleted or was never submitted."
-            else:
-                raise e
-        
-        # Delete the sitemap
-        service.sitemaps().delete(siteUrl=site_url, feedpath=sitemap_url).execute()
-        
-        return f"Successfully deleted sitemap: {sitemap_url}\n\nNote: This only removes the sitemap from Search Console. Any URLs already indexed will remain in Google's index."
-    
-    except Exception as e:
-        return f"Error deleting sitemap: {str(e)}"
-
-@mcp.tool()
 async def manage_sitemaps(site_url: str, action: str, sitemap_url: str = None, sitemap_index: str = None) -> str:
     """
     All-in-one tool to manage sitemaps (list, get details, submit, delete).
@@ -1541,21 +1461,21 @@ async def manage_sitemaps(site_url: str, action: str, sitemap_url: str = None, s
         site_url: Exact GSC property URL from list_properties (e.g. "https://example.com/" or
                   "sc-domain:example.com"). Domain properties cover all subdomains — use the
                   domain property as site_url and filter by page to analyze a specific subdomain.
-        action: The action to perform (list, details, submit, delete)
-        sitemap_url: The full URL of the sitemap (required for details, submit, delete)
+        action: The action to perform (list, details, submit)
+        sitemap_url: The full URL of the sitemap (required for details, submit)
         sitemap_index: Optional sitemap index URL for listing child sitemaps (only used with 'list' action)
     """
     try:
         # Validate inputs
         action = action.lower().strip()
-        valid_actions = ["list", "details", "submit", "delete"]
-        
+        valid_actions = ["list", "details", "submit"]
+
         if action not in valid_actions:
             return f"Invalid action: {action}. Please use one of: {', '.join(valid_actions)}"
-        
-        if action in ["details", "submit", "delete"] and not sitemap_url:
+
+        if action in ["details", "submit"] and not sitemap_url:
             return f"The {action} action requires a sitemap_url parameter."
-        
+
         # Perform the requested action
         if action == "list":
             return await list_sitemaps_enhanced(site_url, sitemap_index)
@@ -1563,8 +1483,6 @@ async def manage_sitemaps(site_url: str, action: str, sitemap_url: str = None, s
             return await get_sitemap_details(site_url, sitemap_url)
         elif action == "submit":
             return await submit_sitemap(site_url, sitemap_url)
-        elif action == "delete":
-            return await delete_sitemap(site_url, sitemap_url)
     
     except Exception as e:
         return f"Error managing sitemaps: {str(e)}"

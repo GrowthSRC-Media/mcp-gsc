@@ -166,15 +166,15 @@ Print this block verbatim:
    ─────────────────────────────────────────────────────
    BEFORE you restart Claude Desktop:
 
-   Open your browser and make sure you are signed into the Google account
-   that has access to your Google Search Console properties.
+   1. Open your browser and make sure you are signed into the Google account
+      that has access to your Google Search Console properties.
 
-   If you have multiple Google accounts in the browser, switch to the
-   correct one NOW — whichever account is active in the browser when
-   Claude Desktop first starts the server is the one that gets authorized.
+   2. If you have multiple Google accounts in the browser, switch to the
+      correct one NOW — the account that is active in the browser at the
+      moment the OAuth popup appears is the one that gets authorized.
 
-   If the wrong account gets authorized later, use the "reauthenticate"
-   tool inside Claude Desktop to redo the OAuth flow.
+   3. If you accidentally authorize the wrong account, you can fix it
+      at any time — see the "Wrong account?" section below.
    ─────────────────────────────────────────────────────
 
 ---
@@ -190,6 +190,39 @@ Tell the user:
 4. In Claude Desktop, open a new chat and type: `list_sites`
    - If you see your GSC properties listed → setup is complete
    - If Claude Desktop says "server not running" → the dependencies may not have installed correctly. Go back to Step 2 and re-run the pip install.
+
+---
+
+## STEP 9 — Reauthentication (wrong account or need to switch accounts)
+
+**When to do this:** Any time the wrong Google account was authorized, `list_sites` returns sites you don't recognize, or you want to switch to a different Google account.
+
+**How it works:** The server stores the authorized token in `token.json` in the project folder. The `reauthenticate` tool deletes that file and triggers a fresh OAuth flow so you can sign in with the correct account.
+
+**To reauthenticate:**
+
+Print this block verbatim:
+
+   ─────────────────────────────────────────────────────
+   TO SWITCH GOOGLE ACCOUNTS or fix a wrong-account authorization:
+
+   1. In your browser, switch to the correct Google account NOW
+      (the one that has access to your GSC properties).
+
+   2. In Claude Desktop, open a new chat and say:
+         "reauthenticate" or "re-authenticate" or "switch google account"
+
+   3. A browser popup will appear — approve it with the correct account.
+
+   4. Once done, type `list_sites` to confirm the right properties appear.
+
+   You can reauthenticate as many times as needed — it will not break
+   anything or affect your GSC data.
+   ─────────────────────────────────────────────────────
+
+**If the user asks to reauthenticate, switch accounts, or fix a wrong-account issue:**
+- Tell them to switch to the correct account in their browser first
+- Then tell them to say "reauthenticate" in a Claude Desktop chat — the `reauthenticate` MCP tool will handle the rest automatically
 
 ---
 
@@ -212,5 +245,6 @@ Tell the user:
 - Confirmation that `client_secrets.json` is present with a valid `client_id`
 - The exact JSON written to `claude_desktop_config.json`
 - The full path of the config file that was actually used
-- Reminder to have the correct browser account active before restarting Claude Desktop
+- Reminder to switch browser to the correct Google account BEFORE restarting Claude Desktop
 - Reminder to restart Claude Desktop and test with `list_sites`
+- Reminder that if the wrong account gets authorized, the user can say "reauthenticate" in Claude Desktop to fix it at any time
